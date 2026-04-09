@@ -3,3 +3,5 @@ MQL5/Library/TSVSaverDLL/bin/
 MQL5/Library/TSVSaverDLL/obj/
 *.ex5
 *.gz
+.venv/
+activate_venv.sh
