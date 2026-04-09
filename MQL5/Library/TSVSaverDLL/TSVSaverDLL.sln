@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.14.36930.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "TSVSaverDLL", "TSVSaverDLL.csproj", "{2593B34B-EB2D-4504-935E-889C2AE960FA}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{2593B34B-EB2D-4504-935E-889C2AE960FA}.Debug|x64.ActiveCfg = Debug|x64
+		{2593B34B-EB2D-4504-935E-889C2AE960FA}.Debug|x64.Build.0 = Debug|x64
+		{2593B34B-EB2D-4504-935E-889C2AE960FA}.Release|x64.ActiveCfg = Release|x64
+		{2593B34B-EB2D-4504-935E-889C2AE960FA}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {64823178-9917-44D3-B13A-C3D3A83401B3}
+	EndGlobalSection
+EndGlobal

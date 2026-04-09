@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net46</TargetFramework>
+    <RootNamespace>TSVSaverDLL</RootNamespace>
+    <AssemblyName>TSVSaverDLL</AssemblyName>
+    <Deterministic>true</Deterministic>
+    <LangVersion>latest</LangVersion>
+    <Platforms>x64</Platforms>
+  </PropertyGroup>
+
+</Project>
