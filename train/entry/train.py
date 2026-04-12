@@ -6,12 +6,16 @@ File: train/entry/train.py
 本モジュールは、特徴量Parquetを読み込み、Transformerモデルの学習・検証・テストを実行します。
 過学習を防ぐためのEarly Stopping、学習率スケジューラ（ReduceLROnPlateau）、および
 最適なモデル重みの保存（チェックポイント）機能を統合管理する学習パイプラインのエントリーポイントです。
+
+Walk-Forward Validation（ウォークフォワード検証）に対応し、時系列のスライディングウィンドウごとに
+モデルの学習と評価を繰り返し実行します。
 """
 
 import argparse
 import glob
 import os
 import time
+from pathlib import Path
 from typing import List
 
 import torch
@@ -102,6 +106,42 @@ def validate_epoch(
     return total_loss / len(dataloader.dataset)
 
 
+def build_output_model_path(base_dir: str, target_file_path: str) -> str:
+    """
+    出力先モデルパスを、対象 parquet の日付・セッション種別から構築します。
+
+    出力形式:
+        data/entry/DAY/20YY/20YY-MM-DD.pth
+        data/entry/NIGHT/20YY/20YY-MM-DD.pth
+
+    Args:
+        base_dir (str): 例: "data"
+        target_file_path (str): 例: data/features/entry/DAY/2018/2018-01-04.parquet
+
+    Returns:
+        str: 保存先の .pth パス
+    """
+    normalized = Path(target_file_path)
+
+    # .../entry/<SESSION>/<YEAR>/<YYYY-MM-DD>.parquet を想定
+    trade_date_str = normalized.stem
+    year_str = normalized.parent.name
+    session_type = normalized.parent.parent.name
+
+    out_dir = os.path.join(
+        base_dir,
+        "entry",
+        session_type,
+        year_str,
+    )
+    os.makedirs(out_dir, exist_ok=True)
+
+    return os.path.join(
+        out_dir,
+        f"{trade_date_str}.pth",
+    )
+
+
 def main():
     """コマンドライン引数を解析し、モデルの学習パイプライン全体を実行します。"""
     parser = argparse.ArgumentParser(description="Transformerモデルの学習を実行します。")
@@ -111,7 +151,10 @@ def main():
     parser.add_argument("--seq-len", type=int, default=60, help="シーケンス長（過去の足の本数）")
     parser.add_argument("--lr", type=float, default=1e-4, help="初期学習率")
     parser.add_argument("--patience", type=int, default=7, help="Early Stoppingが発動するまでのエポック数")
-    parser.add_argument("--out-model-path", type=str, default="data/models/transformer_entry.pth", help="モデル重みの保存先")
+    parser.add_argument(
+        "--out-base-dir", type=str, default="data",
+        help="モデル出力ベースディレクトリ。実際の保存先は data/entry/<DAY|NIGHT>/<YEAR>/<DATE>.pth"
+    )
     
     # データ分割の設定（例: 学習60日、検証20日、テスト5日）
     parser.add_argument("--train-days", type=int, default=60, help="学習データの日数")
@@ -124,96 +167,115 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # 2. データの取得とDataLoaderの作成
+    # 2. データの取得
     all_files = glob.glob(args.feature_dir)
     if not all_files:
         print(f"エラー: {args.feature_dir} に特徴量ファイルが見つかりません。")
         return
 
-    print(f"Found {len(all_files)} feature files. Constructing dataloaders...")
-    train_loader, valid_loader, test_loader, num_features = create_dataloaders(
-        file_paths=all_files,
-        seq_len=args.seq_len,
-        batch_size=args.batch_size,
-        train_days=args.train_days,
-        valid_days=args.valid_days,
-        test_days=args.test_days
-    )
-    print(f"Input features dimension: {num_features}")
-
-    # 3. モデルの初期化
-    model = TimeSeriesTransformer(
-        num_features=num_features,
-        d_model=128,          # モデルの表現力。大きすぎると過学習しやすくなります
-        nhead=8,              # Multi-Head Attentionの数
-        num_layers=3,         # Encoder層の深さ
-        dim_feedforward=256, 
-        dropout=0.2           # 金融データはノイズが多いのでDropoutは強め(0.2~0.3)に設定
-    ).to(device)
-
-    # 4. 損失関数とオプティマイザ
-    # 効率比の予測（回帰）なので Huber Loss (SmoothL1Loss) を使用し、外れ値への耐性を高めます
-    criterion = nn.SmoothL1Loss()
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    print(f"Found {len(all_files)} feature files. Starting Walk-Forward Validation...")
     
-    # 検証Lossが改善しなくなった場合に学習率を1/2に下げる
-    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
+    # 時系列を 1 回だけ分割するのではなく、
+    # test 窓を 1 日ずつ前へ進めながらループ処理します。
+    total_required = args.train_days + args.valid_days + args.test_days
+    sorted_feature_files = sorted(all_files)
+    
+    if len(sorted_feature_files) < total_required:
+        raise ValueError(
+            f"Not enough feature files. required={total_required}, actual={len(sorted_feature_files)}"
+        )
 
-    # 5. 学習ループ
-    best_valid_loss = float('inf')
-    epochs_no_improve = 0
-    os.makedirs(os.path.dirname(args.out_model_path), exist_ok=True)
-
-    print("--- Training Started ---")
-    start_time = time.time()
-
-    for epoch in range(1, args.epochs + 1):
-        epoch_start = time.time()
+    for end_idx in range(total_required, len(sorted_feature_files) + 1):
+        window_files = sorted_feature_files[end_idx - total_required : end_idx]
         
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
-        valid_loss = validate_epoch(model, valid_loader, criterion, device)
-        
-        prev_lr = optimizer.param_groups[0]["lr"]
-        scheduler.step(valid_loss)
-        current_lr = optimizer.param_groups[0]["lr"]
-        epoch_duration = time.time() - epoch_start
-        
-        print(f"Epoch {epoch:03d}/{args.epochs:03d} | "
-              f"Train Loss: {train_loss:.6f} | Valid Loss: {valid_loss:.6f} | "
-              f"LR: {current_lr:.8f} | "
-              f"Time: {epoch_duration:.1f}s")
+        train_loader, valid_loader, test_loader, metadata = create_dataloaders(
+            file_paths=window_files,
+            seq_len=args.seq_len,
+            batch_size=args.batch_size,
+            train_days=args.train_days,
+            valid_days=args.valid_days,
+            test_days=args.test_days,
+        )
 
-        if current_lr != prev_lr:
+        split_files = metadata["split_files"]
+        test_files = split_files.test_files
+        
+        if not test_files:
+            print("No test files in current window. Skip.")
+            continue
+
+        out_model_path = build_output_model_path(
+            base_dir=args.out_base_dir,
+            target_file_path=test_files[0],
+        )
+
+        print(f"Current test target: {test_files[0]}")
+        print(f"Model output path: {out_model_path}")
+
+        # 3. モデルの初期化
+        num_features = metadata["num_features"]
+        model = TimeSeriesTransformer(
+            num_features=num_features,
+            d_model=128,          # モデルの表現力。大きすぎると過学習しやすくなります
+            nhead=8,              # Multi-Head Attentionの数
+            num_layers=3,         # Encoder層の深さ
+            dim_feedforward=256, 
+            dropout=0.2           # 金融データはノイズが多いのでDropoutは強め(0.2~0.3)に設定
+        ).to(device)
+
+        # 4. 損失関数とオプティマイザ
+        criterion = nn.SmoothL1Loss()
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+        scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
+
+        # 5. 学習ループ
+        best_valid_loss = float("inf")
+        epochs_no_improve = 0
+
+        for epoch in range(1, args.epochs + 1):
+            epoch_start = time.time()
+            
+            train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
+            valid_loss = validate_epoch(model, valid_loader, criterion, device)
+            
+            prev_lr = optimizer.param_groups[0]["lr"]
+            scheduler.step(valid_loss)
+            current_lr = optimizer.param_groups[0]["lr"]
+            epoch_duration = time.time() - epoch_start
+            
             print(
-                f"  -> Learning rate changed: {prev_lr:.8f} -> {current_lr:.8f}"
+                f"Epoch {epoch:03d}/{args.epochs:03d} | "
+                f"Train Loss: {train_loss:.6f} | Valid Loss: {valid_loss:.6f} | "
+                f"LR: {current_lr:.8f} | Time: {epoch_duration:.1f}s"
             )
-        
-        # Early Stopping とモデル保存の判定
-        if valid_loss < best_valid_loss:
-            best_valid_loss = valid_loss
-            epochs_no_improve = 0
-            # ベストな重みを保存
-            torch.save(model.state_dict(), args.out_model_path)
-            print(f"  -> Best model saved! (Valid Loss: {best_valid_loss:.6f})")
-        else:
-            epochs_no_improve += 1
+
+            if current_lr != prev_lr:
+                print(f"  -> Learning rate changed: {prev_lr:.8f} -> {current_lr:.8f}")
+            
+            # Early Stopping とモデル保存の判定
+            if valid_loss < best_valid_loss:
+                best_valid_loss = valid_loss
+                epochs_no_improve = 0
+                torch.save(model.state_dict(), out_model_path)
+                print(f"  -> Best model saved to: {out_model_path}")
+            else:
+                epochs_no_improve += 1
+                
             if epochs_no_improve >= args.patience:
-                print(f"\nEarly stopping triggered. No improvement for {args.patience} epochs.")
+                print("Early stopping triggered.")
                 break
 
-    total_time = time.time() - start_time
-    print(f"--- Training Completed in {total_time / 60:.2f} mins ---")
-
-    # 6. テストデータでの最終評価
-    print("\nLoading best model for Test evaluation...")
-    state_dict = torch.load(
-        args.out_model_path,
-        map_location=device,
-        weights_only=True,
-    )
-    model.load_state_dict(state_dict)
-    test_loss = validate_epoch(model, test_loader, criterion, device)
-    print(f"Final Test Loss: {test_loss:.6f}")
+        # 6. テストデータでの最終評価
+        print("\nLoading best model for Test evaluation...")
+        state_dict = torch.load(
+            out_model_path,
+            map_location=device,
+            weights_only=True,
+        )
+        model.load_state_dict(state_dict)
+        test_loss = validate_epoch(model, test_loader, criterion, device)
+        print(f"Final Test Loss: {test_loss:.6f}")
+        print("-" * 80)
 
 
 if __name__ == "__main__":
