@@ -206,14 +206,19 @@ def main():
     for end_idx in range(total_required, len(sorted_feature_files) + 1):
         window_files = sorted_feature_files[end_idx - total_required : end_idx]
         
-        train_loader, valid_loader, test_loader, num_features = create_dataloaders(
-            file_paths=window_files,
-            seq_len=args.seq_len,
-            batch_size=args.batch_size,
-            train_days=args.train_days,
-            valid_days=args.valid_days,
-            test_days=args.test_days,
-        )
+        # SeqLen未満のファイルに起因する例外などをキャッチし、該当ウィンドウをスキップする
+        try:
+            train_loader, valid_loader, test_loader, num_features = create_dataloaders(
+                file_paths=window_files,
+                seq_len=args.seq_len,
+                batch_size=args.batch_size,
+                train_days=args.train_days,
+                valid_days=args.valid_days,
+                test_days=args.test_days,
+            )
+        except ValueError as e:
+            logging.warning(f"Skipping window ending at {window_files[-1]}: {e}")
+            continue
 
         # 現在のウィンドウの末尾（test_days分）がテスト対象のファイル
         test_files = window_files[-args.test_days:]

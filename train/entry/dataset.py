@@ -147,7 +147,7 @@ def create_dataloaders(
             (Train DataLoader, Valid DataLoader, Test DataLoader, 特徴量の次元数)
             
     Raises:
-        ValueError: 指定された日数に対してファイル数が不足している場合。
+        ValueError: 指定された日数に対してファイル数が不足している場合、または抽出可能なシーケンスがない場合。
     """
     # 日付が含まれるパス名でソートし、時系列を保証
     sorted_files = sorted(file_paths)
@@ -171,7 +171,7 @@ def create_dataloaders(
     print("Computing scaling statistics from Train data...")
     means, stds = compute_train_statistics(train_files, label_col="label_efficiency_240")
 
-    def build_concat_dataset(files: List[str], feature_means: Dict[str, float], feature_stds: Dict[str, float]) -> ConcatDataset:
+    def build_concat_dataset(files: List[str], feature_means: Dict[str, float], feature_stds: Dict[str, float]) -> Optional[ConcatDataset]:
         """複数ファイルのDatasetを1つのDatasetに結合するヘルパー関数。"""
         datasets = []
         for f in files:
@@ -184,12 +184,18 @@ def create_dataloaders(
             # データが存在する（seq_len以上の行数がある）場合のみ追加
             if len(ds) > 0:
                 datasets.append(ds)
+                
+        if not datasets:
+            return None
         return ConcatDataset(datasets)
 
     train_ds = build_concat_dataset(train_files, means, stds)
     valid_ds = build_concat_dataset(valid_files, means, stds)
     test_ds = build_concat_dataset(test_files, means, stds)
     
+    if train_ds is None or valid_ds is None or test_ds is None:
+        raise ValueError("抽出可能なシーケンスが存在しません（ファイル内のデータ行数がseq_len未満です）。")
+
     # DataLoaderの作成
     # Trainはシャッフルして学習効率を高め、Valid/Testは時系列順のまま評価する
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
