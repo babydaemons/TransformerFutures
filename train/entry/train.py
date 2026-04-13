@@ -13,8 +13,10 @@ Walk-Forward Validation（ウォークフォワード検証）に対応し、時
 
 import argparse
 import glob
+import logging
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import List
 
@@ -35,7 +37,8 @@ def train_epoch(
     optimizer: optim.Optimizer,
     device: torch.device,
 ) -> float:
-    """1エポック分の学習を実行します。
+    """
+    1エポック分の学習を実行します。
 
     Args:
         model (nn.Module): 学習対象のPyTorchモデル。
@@ -80,7 +83,8 @@ def validate_epoch(
     criterion: nn.Module,
     device: torch.device,
 ) -> float:
-    """1エポック分の検証（評価）を実行します。
+    """
+    1エポック分の検証（評価）を実行します。
 
     Args:
         model (nn.Module): 評価対象のPyTorchモデル。
@@ -115,8 +119,8 @@ def build_output_model_path(base_dir: str, target_file_path: str) -> str:
         data/entry/NIGHT/20YY/20YY-MM-DD.pth
 
     Args:
-        base_dir (str): 例: "data"
-        target_file_path (str): 例: data/features/entry/DAY/2018/2018-01-04.parquet
+        base_dir (str): ベースディレクトリ (例: "data")
+        target_file_path (str): 対象ファイルパス (例: data/features/entry/DAY/2018/2018-01-04.parquet)
 
     Returns:
         str: 保存先の .pth パス
@@ -144,6 +148,20 @@ def build_output_model_path(base_dir: str, target_file_path: str) -> str:
 
 def main():
     """コマンドライン引数を解析し、モデルの学習パイプライン全体を実行します。"""
+    
+    # ログ出力の設定
+    os.makedirs("logs", exist_ok=True)
+    log_file = os.path.join("logs", datetime.now().strftime("%Y%m%d-%H%M") + ".log")
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_file, encoding="utf-8"),
+            logging.StreamHandler()
+        ]
+    )
+
     parser = argparse.ArgumentParser(description="Transformerモデルの学習を実行します。")
     parser.add_argument("--feature-dir", type=str, default="data/features/entry/*/*/*.parquet", help="特徴量Parquetのパスパターン")
     parser.add_argument("--epochs", type=int, default=50, help="最大学習エポック数")
@@ -165,15 +183,15 @@ def main():
 
     # 1. デバイスの設定
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    logging.info(f"Using device: {device}")
 
     # 2. データの取得
     all_files = glob.glob(args.feature_dir)
     if not all_files:
-        print(f"エラー: {args.feature_dir} に特徴量ファイルが見つかりません。")
+        logging.error(f"エラー: {args.feature_dir} に特徴量ファイルが見つかりません。")
         return
 
-    print(f"Found {len(all_files)} feature files. Starting Walk-Forward Validation...")
+    logging.info(f"Found {len(all_files)} feature files. Starting Walk-Forward Validation...")
     
     # 時系列を 1 回だけ分割するのではなく、
     # test 窓を 1 日ずつ前へ進めながらループ処理します。
@@ -188,7 +206,7 @@ def main():
     for end_idx in range(total_required, len(sorted_feature_files) + 1):
         window_files = sorted_feature_files[end_idx - total_required : end_idx]
         
-        train_loader, valid_loader, test_loader, metadata = create_dataloaders(
+        train_loader, valid_loader, test_loader, num_features = create_dataloaders(
             file_paths=window_files,
             seq_len=args.seq_len,
             batch_size=args.batch_size,
@@ -197,11 +215,11 @@ def main():
             test_days=args.test_days,
         )
 
-        split_files = metadata["split_files"]
-        test_files = split_files.test_files
+        # 現在のウィンドウの末尾（test_days分）がテスト対象のファイル
+        test_files = window_files[-args.test_days:]
         
         if not test_files:
-            print("No test files in current window. Skip.")
+            logging.warning("No test files in current window. Skip.")
             continue
 
         out_model_path = build_output_model_path(
@@ -209,11 +227,10 @@ def main():
             target_file_path=test_files[0],
         )
 
-        print(f"Current test target: {test_files[0]}")
-        print(f"Model output path: {out_model_path}")
+        logging.info(f"Current test target: {test_files[0]}")
+        logging.info(f"Model output path: {out_model_path}")
 
         # 3. モデルの初期化
-        num_features = metadata["num_features"]
         model = TimeSeriesTransformer(
             num_features=num_features,
             d_model=128,          # モデルの表現力。大きすぎると過学習しやすくなります
@@ -243,30 +260,30 @@ def main():
             current_lr = optimizer.param_groups[0]["lr"]
             epoch_duration = time.time() - epoch_start
             
-            print(
+            logging.info(
                 f"Epoch {epoch:03d}/{args.epochs:03d} | "
                 f"Train Loss: {train_loss:.6f} | Valid Loss: {valid_loss:.6f} | "
                 f"LR: {current_lr:.8f} | Time: {epoch_duration:.1f}s"
             )
 
             if current_lr != prev_lr:
-                print(f"  -> Learning rate changed: {prev_lr:.8f} -> {current_lr:.8f}")
+                logging.info(f"  -> Learning rate changed: {prev_lr:.8f} -> {current_lr:.8f}")
             
             # Early Stopping とモデル保存の判定
             if valid_loss < best_valid_loss:
                 best_valid_loss = valid_loss
                 epochs_no_improve = 0
                 torch.save(model.state_dict(), out_model_path)
-                print(f"  -> Best model saved to: {out_model_path}")
+                logging.info(f"  -> Best model saved to: {out_model_path}")
             else:
                 epochs_no_improve += 1
                 
             if epochs_no_improve >= args.patience:
-                print("Early stopping triggered.")
+                logging.info("Early stopping triggered.")
                 break
 
         # 6. テストデータでの最終評価
-        print("\nLoading best model for Test evaluation...")
+        logging.info("Loading best model for Test evaluation...")
         state_dict = torch.load(
             out_model_path,
             map_location=device,
@@ -274,8 +291,8 @@ def main():
         )
         model.load_state_dict(state_dict)
         test_loss = validate_epoch(model, test_loader, criterion, device)
-        print(f"Final Test Loss: {test_loss:.6f}")
-        print("-" * 80)
+        logging.info(f"Final Test Loss: {test_loss:.6f}")
+        logging.info("-" * 80)
 
 
 if __name__ == "__main__":
