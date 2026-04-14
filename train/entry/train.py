@@ -8,7 +8,8 @@ File: train/entry/train.py
 最適なモデル重みの保存（チェックポイント）機能を統合管理する学習パイプラインのエントリーポイントです。
 
 Walk-Forward Validation（ウォークフォワード検証）に対応し、時系列のスライディングウィンドウごとに
-モデルの学習と評価を繰り返し実行します。
+モデルの学習と評価を繰り返し実行します。テスト時には、単なるLossだけでなく、
+実運用における優位性（エッジ）を検証するためのビジネス指標（相関、上位パーセンタイルの効率性）も評価します。
 """
 
 import argparse
@@ -20,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -299,8 +301,42 @@ def main():
             weights_only=True,
         )
         model.load_state_dict(state_dict)
-        test_loss = validate_epoch(model, test_loader, criterion, device)
+        
+        # ====== トレード向けのビジネス指標評価 ======
+        model.eval()
+        test_loss = 0.0
+        all_preds = []
+        all_trues = []
+
+        with torch.no_grad():
+            for batch_x, batch_y in test_loader:
+                batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+                outputs = model(batch_x)
+                loss = criterion(outputs, batch_y)
+                test_loss += loss.item() * batch_x.size(0)
+                
+                # 予測値と実際のラベルを保存
+                all_preds.extend(outputs.cpu().numpy().flatten())
+                all_trues.extend(batch_y.cpu().numpy().flatten())
+                
+        test_loss /= len(test_loader.dataset)
         logging.info(f"Final Test Loss: {test_loss:.6f}")
+        
+        preds_np = np.array(all_preds)
+        trues_np = np.array(all_trues)
+        
+        # 予測のエッジ（優位性）の定量的評価
+        if len(preds_np) > 1:
+            correlation = np.corrcoef(preds_np, trues_np)[0, 1]
+            logging.info(f"# Pearson Correlation: {correlation:.4f}")
+            
+            threshold = np.percentile(preds_np, 80) # 上位20%の予測スコア閾値
+            high_conf_idx = preds_np >= threshold
+            
+            logging.info(f"# Baseline Avg Efficiency: {trues_np.mean():.4f}")
+            logging.info(f"# Top 20% Avg Efficiency:  {trues_np[high_conf_idx].mean():.4f}")
+            logging.info(f"# Edge (Improvement):      {(trues_np[high_conf_idx].mean() - trues_np.mean()) * 100:.2f}%")
+            
         logging.info("-" * 80)
 
 
