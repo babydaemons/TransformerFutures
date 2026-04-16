@@ -8,5 +8,7 @@ __pycache__/
 *.csv
 *.parquet
 *.pth
+*.tar
+*.log
 .venv/
 activate_venv.sh

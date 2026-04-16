@@ -7,9 +7,11 @@ File: train/entry/train.py
 過学習を防ぐためのEarly Stopping、学習率スケジューラ（ReduceLROnPlateau）、および
 最適なモデル重みの保存（チェックポイント）機能を統合管理する学習パイプラインのエントリーポイントです。
 
-Walk-Forward Validation（ウォークフォワード検証）に対応し、時系列のスライディングウィンドウごとに
-モデルの学習と評価を繰り返し実行します。テスト時には、単なるLossだけでなく、
-実運用における優位性（エッジ）を検証するためのビジネス指標（相関、上位パーセンタイルの効率性）も評価します。
+本戦略は回帰ではなく、優位性の高いトレンドが発生するかどうかの「分類タスク（Classification）」として
+学習を行います。Walk-Forward Validation（ウォークフォワード検証）に対応し、
+時系列のスライディングウィンドウごとにモデルの学習と評価を繰り返し実行します。
+テスト時には、ROC AUCスコアや上位パーセンタイルにおけるトレンド発生確率といった
+実運用における優位性（エッジ）を評価します。
 """
 
 import argparse
@@ -22,6 +24,7 @@ from pathlib import Path
 from typing import List
 
 import numpy as np
+from sklearn.metrics import roc_auc_score
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -45,7 +48,7 @@ def train_epoch(
     Args:
         model (nn.Module): 学習対象のPyTorchモデル。
         dataloader (DataLoader): 学習用データのDataLoader。
-        criterion (nn.Module): 損失関数。
+        criterion (nn.Module): 損失関数（分類タスクのためBCEWithLogitsLossを想定）。
         optimizer (optim.Optimizer): 最適化アルゴリズム。
         device (torch.device): 演算に使用するデバイス (CPU/GPU)。
 
@@ -63,8 +66,9 @@ def train_epoch(
         # 順伝播
         outputs = model(batch_x)
         
-        # 損失計算 (Batch, 1) と (Batch, 1) の誤差
-        loss = criterion(outputs, batch_y)
+        # 損失計算: outputsは (Batch, 1), batch_yは (Batch,) なので次元を合わせる
+        target = batch_y.unsqueeze(-1) if batch_y.dim() == 1 else batch_y
+        loss = criterion(outputs, target)
         
         # 逆伝播と重み更新
         loss.backward()
@@ -105,7 +109,10 @@ def validate_epoch(
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
             
             outputs = model(batch_x)
-            loss = criterion(outputs, batch_y)
+            
+            # 損失計算: 次元を合わせて計算
+            target = batch_y.unsqueeze(-1) if batch_y.dim() == 1 else batch_y
+            loss = criterion(outputs, target)
             
             total_loss += loss.item() * batch_x.size(0)
             
@@ -117,8 +124,7 @@ def build_output_model_path(base_dir: str, target_file_path: str) -> str:
     出力先モデルパスを、対象 parquet の日付・セッション種別から構築します。
 
     出力形式:
-        data/entry/DAY/20YY/20YY-MM-DD.pth
-        data/entry/NIGHT/20YY/20YY-MM-DD.pth
+        <base_dir>/entry/<SESSION>/<YEAR>/<YYYY-MM-DD>.pth
 
     Args:
         base_dir (str): ベースディレクトリ (例: "data")
@@ -149,9 +155,11 @@ def build_output_model_path(base_dir: str, target_file_path: str) -> str:
 
 
 def main():
-    """コマンドライン引数を解析し、モデルの学習パイプライン全体を実行します。"""
+    """コマンドライン引数を解析し、モデルの学習・テストパイプライン全体を実行します。"""
     
-    # ログ出力の設定
+    # ==========================================
+    # 1. ログと引数の設定
+    # ==========================================
     os.makedirs("logs", exist_ok=True)
     log_file = os.path.join("logs", datetime.now().strftime("%Y%m%d-%H%M") + ".log")
     
@@ -184,11 +192,13 @@ def main():
     
     args = parser.parse_args()
 
-    # 1. デバイスの設定
+    # デバイスの設定
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
 
-    # 2. データの取得
+    # ==========================================
+    # 2. データの取得とWalk-Forward Validationの準備
+    # ==========================================
     all_files = glob.glob(args.feature_dir)
     if not all_files:
         logging.error(f"エラー: {args.feature_dir} に特徴量ファイルが見つかりません。")
@@ -241,22 +251,34 @@ def main():
         logging.info(f"Current test target: {test_files[0]}")
         logging.info(f"Model output path: {out_model_path}")
 
+        # ==========================================
         # 3. モデルの初期化
+        # ==========================================
         model = TimeSeriesTransformer(
             num_features=num_features,
             d_model=128,          # モデルの表現力。大きすぎると過学習しやすくなります
             nhead=8,              # Multi-Head Attentionの数
             num_layers=3,         # Encoder層の深さ
             dim_feedforward=256, 
-            dropout=0.2           # 金融データはノイズが多いのでDropoutは強め(0.2~0.3)に設定
+            dropout=0.2           # 金融データはノイズが多いのでDropoutは強めに設定
         ).to(device)
 
+        # ==========================================
         # 4. 損失関数とオプティマイザ
-        criterion = nn.SmoothL1Loss()
+        # ==========================================
+        # 分類タスク（強いトレンドが発生するかどうか）なので BCEWithLogitsLoss を使用します
+        # 不均衡データ（トレンド発生確率が低い）対策としてポジティブサンプルに重みを付けます
+        pos_weight = torch.tensor([4.0]).to(device)  # 発生確率が約20%なら4.0程度が目安
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+        
+        # 検証Lossが改善しなくなった場合に学習率を1/2に下げる
         scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
 
+        # ==========================================
         # 5. 学習ループ
+        # ==========================================
         best_valid_loss = float("inf")
         epochs_no_improve = 0
 
@@ -293,7 +315,9 @@ def main():
                 logging.info("Early stopping triggered.")
                 break
 
+        # ==========================================
         # 6. テストデータでの最終評価
+        # ==========================================
         logging.info("Loading best model for Test evaluation...")
         state_dict = torch.load(
             out_model_path,
@@ -312,11 +336,14 @@ def main():
             for batch_x, batch_y in test_loader:
                 batch_x, batch_y = batch_x.to(device), batch_y.to(device)
                 outputs = model(batch_x)
-                loss = criterion(outputs, batch_y)
+                
+                target = batch_y.unsqueeze(-1) if batch_y.dim() == 1 else batch_y
+                loss = criterion(outputs, target)
                 test_loss += loss.item() * batch_x.size(0)
                 
-                # 予測値と実際のラベルを保存
-                all_preds.extend(outputs.cpu().numpy().flatten())
+                # ロジットをSigmoidに通して確率(0.0~1.0)に変換して保存
+                probs = torch.sigmoid(outputs).cpu().numpy().flatten()
+                all_preds.extend(probs)
                 all_trues.extend(batch_y.cpu().numpy().flatten())
                 
         test_loss /= len(test_loader.dataset)
@@ -327,15 +354,20 @@ def main():
         
         # 予測のエッジ（優位性）の定量的評価
         if len(preds_np) > 1:
-            correlation = np.corrcoef(preds_np, trues_np)[0, 1]
-            logging.info(f"# Pearson Correlation: {correlation:.4f}")
+            # ROC AUCの計算 (正例と負例が両方存在する場合のみ)
+            if len(np.unique(trues_np)) > 1:
+                auc = roc_auc_score(trues_np, preds_np)
+                logging.info(f"# ROC AUC Score: {auc:.4f}")
             
             threshold = np.percentile(preds_np, 80) # 上位20%の予測スコア閾値
             high_conf_idx = preds_np >= threshold
             
-            logging.info(f"# Baseline Avg Efficiency: {trues_np.mean():.4f}")
-            logging.info(f"# Top 20% Avg Efficiency:  {trues_np[high_conf_idx].mean():.4f}")
-            logging.info(f"# Edge (Improvement):      {(trues_np[high_conf_idx].mean() - trues_np.mean()) * 100:.2f}%")
+            baseline_prob = trues_np.mean()
+            top20_prob = trues_np[high_conf_idx].mean() if high_conf_idx.sum() > 0 else 0.0
+            
+            logging.info(f"# Baseline Trend Prob: {baseline_prob * 100:.2f}%")
+            logging.info(f"# Top 20% Trend Prob:  {top20_prob * 100:.2f}%")
+            logging.info(f"# Edge (Improvement):  {(top20_prob - baseline_prob) * 100:.2f}%")
             
         logging.info("-" * 80)
 

@@ -10,6 +10,8 @@ File: train/entry/dataset.py
 防ぐため、1ファイルごとに独立してシーケンスをスライディングウィンドウで抽出します。
 さらに、Trainデータから算出した統計量（平均・標準偏差）を用いてZ-score正規化を
 実行し、検証・テストデータへの情報漏洩（Data Leakage）を防止します。
+また、分類タスクへの対応として、Trainデータから算出した閾値（上位パーセンタイル）を
+用いて連続値ラベルを2値化（0 or 1）する機能も提供します。
 """
 
 from typing import List, Tuple, Dict, Optional
@@ -18,17 +20,19 @@ import torch
 from torch.utils.data import Dataset, ConcatDataset, DataLoader
 
 
-def compute_train_statistics(train_files: List[str], label_col: str) -> Tuple[Dict[str, float], Dict[str, float]]:
-    """Trainデータ全体から各特徴量の平均と標準偏差を事前計算します。
+def compute_train_statistics(train_files: List[str], label_col: str, top_percentile: float = 80.0) -> Tuple[Dict[str, float], Dict[str, float], float]:
+    """Trainデータ全体から各特徴量の平均・標準偏差と、ラベルの2値化閾値を事前計算します。
 
     Args:
         train_files (List[str]): 学習用データのParquetファイルパスのリスト。
         label_col (str): 目的変数の列名。統計量計算から除外するため。
+        top_percentile (float, optional): 上位何%を正例とするかのパーセンタイル値。デフォルトは 80.0 (上位20%)。
 
     Returns:
-        Tuple[Dict[str, float], Dict[str, float]]:
+        Tuple[Dict[str, float], Dict[str, float], float]:
             - means: 各特徴量の平均値を格納した辞書。
             - stds: 各特徴量の標準偏差を格納した辞書。
+            - label_threshold: 目的変数を2値化するための閾値。
     """
     # スキーマ（列情報）を取得するために先頭ファイルを読み込む
     df_sample = pl.read_parquet(train_files[0])
@@ -41,16 +45,19 @@ def compute_train_statistics(train_files: List[str], label_col: str) -> Tuple[Di
     lf = pl.scan_parquet(train_files)
     mean_exprs = [pl.col(c).mean().alias(f"{c}_mean") for c in feature_cols]
     std_exprs = [pl.col(c).std().alias(f"{c}_std") for c in feature_cols]
+    label_expr = pl.col(label_col).quantile(top_percentile / 100.0).alias("label_threshold")
 
-    stats_df = lf.select(mean_exprs + std_exprs).collect()
+    stats_df = lf.select(mean_exprs + std_exprs + [label_expr]).collect()
 
     means = {c: stats_df[f"{c}_mean"][0] for c in feature_cols}
     
     # ゼロ除算を避けるため、標準偏差が 0 または null の場合は 1.0 にフォールバックします
     stds = {c: stats_df[f"{c}_std"][0] if stats_df[f"{c}_std"][0] else 1.0 for c in feature_cols}
     stds = {c: val if val != 0.0 else 1.0 for c, val in stds.items()}
+    
+    label_threshold = stats_df["label_threshold"][0]
 
-    return means, stds
+    return means, stds, label_threshold
 
 
 class SessionSequenceDataset(Dataset):
@@ -62,7 +69,8 @@ class SessionSequenceDataset(Dataset):
         seq_len: int = 60,
         label_col: str = "label_efficiency_240",
         feature_means: Optional[Dict[str, float]] = None,
-        feature_stds: Optional[Dict[str, float]] = None
+        feature_stds: Optional[Dict[str, float]] = None,
+        label_threshold: Optional[float] = None
     ):
         """
         Args:
@@ -71,6 +79,7 @@ class SessionSequenceDataset(Dataset):
             label_col (str, optional): 目的変数の列名。デフォルトは "label_efficiency_240"。
             feature_means (Optional[Dict[str, float]], optional): 正規化に使用する平均値の辞書。
             feature_stds (Optional[Dict[str, float]], optional): 正規化に使用する標準偏差の辞書。
+            label_threshold (Optional[float], optional): ラベルを2値化(0/1)するための閾値。
         """
         df = pl.read_parquet(parquet_path)
         
@@ -89,6 +98,12 @@ class SessionSequenceDataset(Dataset):
                 for col in feature_cols
             ]
             df = df.with_columns(scale_exprs)
+            
+        # 連続値のラベルを、学習データから算出した閾値で2値化(0.0 or 1.0)
+        if label_threshold is not None:
+            df = df.with_columns([
+                (pl.col(label_col) >= label_threshold).cast(pl.Float32).alias(label_col)
+            ])
 
         # PyTorchテンソルへの変換 (Float32)
         self.X_data = torch.tensor(df.select(feature_cols).to_numpy(), dtype=torch.float32)
@@ -168,10 +183,11 @@ def create_dataloaders(
     print(f"Data split: Train={len(train_files)}days, Valid={len(valid_files)}days, Test={len(test_files)}days")
 
     # Trainデータのみから統計量を計算（Data Leakage防止）
-    print("Computing scaling statistics from Train data...")
-    means, stds = compute_train_statistics(train_files, label_col="label_efficiency_240")
+    print("Computing scaling statistics and label threshold from Train data...")
+    means, stds, label_threshold = compute_train_statistics(train_files, label_col="label_efficiency_240", top_percentile=80.0)
+    print(f"Computed label threshold (top 20%): {label_threshold:.5f}")
 
-    def build_concat_dataset(files: List[str], feature_means: Dict[str, float], feature_stds: Dict[str, float]) -> Optional[ConcatDataset]:
+    def build_concat_dataset(files: List[str], feature_means: Dict[str, float], feature_stds: Dict[str, float], label_threshold: float) -> Optional[ConcatDataset]:
         """複数ファイルのDatasetを1つのDatasetに結合するヘルパー関数。"""
         datasets = []
         for f in files:
@@ -179,7 +195,8 @@ def create_dataloaders(
                 f, 
                 seq_len=seq_len, 
                 feature_means=feature_means, 
-                feature_stds=feature_stds
+                feature_stds=feature_stds,
+                label_threshold=label_threshold
             )
             # データが存在する（seq_len以上の行数がある）場合のみ追加
             if len(ds) > 0:
@@ -189,9 +206,9 @@ def create_dataloaders(
             return None
         return ConcatDataset(datasets)
 
-    train_ds = build_concat_dataset(train_files, means, stds)
-    valid_ds = build_concat_dataset(valid_files, means, stds)
-    test_ds = build_concat_dataset(test_files, means, stds)
+    train_ds = build_concat_dataset(train_files, means, stds, label_threshold)
+    valid_ds = build_concat_dataset(valid_files, means, stds, label_threshold)
+    test_ds = build_concat_dataset(test_files, means, stds, label_threshold)
     
     if train_ds is None or valid_ds is None or test_ds is None:
         raise ValueError("抽出可能なシーケンスが存在しません（ファイル内のデータ行数がseq_len未満です）。")
