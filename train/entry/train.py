@@ -18,10 +18,12 @@ File: train/entry/train.py
 
 出力想定:
 - data/entry/<YEAR>/<YYYY-MM-DD>-<DAY|NIGHT>.pth
+- data/entry/<YEAR>/<YYYY-MM-DD>-<DAY|NIGHT>.json
 """
 
 import argparse
 import glob
+import json
 import logging
 import os
 import time
@@ -383,10 +385,17 @@ def main():
 
                 baseline_prob = trues_np.mean()
                 top20_prob = trues_np[high_conf_idx].mean() if high_conf_idx.sum() > 0 else 0.0
+                edge_pct = (top20_prob - baseline_prob) * 100
 
                 logging.info(f"# Baseline Trend Prob: {baseline_prob * 100:.2f}%")
                 logging.info(f"# Top 20% Trend Prob:  {top20_prob * 100:.2f}%")
-                logging.info(f"# Edge (Improvement):  {(top20_prob - baseline_prob) * 100:.2f}%")
+                logging.info(f"# Edge (Improvement):  {edge_pct:.2f}%")
+
+                # エッジ（優位性）の数値をJSONファイルとしてモデルと同じ階層に出力
+                json_path = os.path.splitext(out_model_path)[0] + ".json"
+                with open(json_path, "w", encoding="utf-8") as file_obj:
+                    # 指定のフォーマット通り小数点2桁で丸めて出力
+                    json.dump({"edge": round(float(edge_pct), 2)}, file_obj)
 
             logging.info("-" * 80)
 
