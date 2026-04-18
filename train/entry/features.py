@@ -782,6 +782,14 @@ def build_entry_feature_frame(
     # --- ラベル（目的変数）の生成 ---
     df = add_efficiency_ratio_label(df, horizon=label_horizon)
     
+    # バックテストでの価格復元用に生の絶対価格を保存（定常化の前）
+    df = df.with_columns([
+        pl.col("open").alias("raw_open_abs"),
+        pl.col("high").alias("raw_high_abs"),
+        pl.col("low").alias("raw_low_abs"),
+        pl.col("close").alias("raw_close_abs"),
+    ])
+
     # 生の価格列を差分（定常化）に変換し、欠損となった先頭行をドロップ
     prefixes = list(external_frames.keys()) if external_frames else None
     df = make_prices_stationary(df, external_prefixes=prefixes)
