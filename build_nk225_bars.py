@@ -14,12 +14,14 @@ POC 算出や学習用特徴量生成は行いません。
 2. DAY / NIGHT セッションごとに 30秒足へ集約する
 3. OHLCV、buy_volume、sell_volume、signed_volume、VWAP を算出する
 4. session_type ごとに bar parquet を 1日1ファイルで保存する
+
+出力フォーマット:
+  data/bars/nk225_30s/<YEAR>/<YYYY-MM-DD>-<DAY|NIGHT>.parquet
 """
 
 import argparse
 import glob
 import os
-from datetime import time
 from typing import Iterable
 
 import polars as pl
@@ -219,10 +221,9 @@ def save_daily_bars(bar_df: pl.DataFrame, output_base_dir: str) -> None:
             output_base_dir,
             "bars",
             "nk225_30s",
-            session_type,
             year_str,
         )
-        out_path = os.path.join(out_dir, f"{trade_date_str}.parquet")
+        out_path = os.path.join(out_dir, f"{trade_date_str}-{session_type}.parquet")
 
         os.makedirs(out_dir, exist_ok=True)
         # 時系列順にソートして圧縮保存

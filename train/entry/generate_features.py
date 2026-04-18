@@ -18,13 +18,13 @@ PolarsのLazyFrameを活用し、数年分のデータでも省メモリで
 
 入力想定:
 - NK225:
-  data/bars/nk225_30s/<DAY|NIGHT>/<YEAR>/<YYYY-MM-DD>.parquet
+  data/bars/nk225_30s/<YEAR>/<YYYY-MM-DD>-<DAY|NIGHT>.parquet
 - 外部指標:
-  data/bars/external_30s/<SYMBOL>/<DAY|NIGHT>/<YEAR>/<YYYY-MM-DD>.parquet
+  data/bars/external_30s/<SYMBOL>/<YEAR>/<YYYY-MM-DD>-<DAY|NIGHT>.parquet
 
 出力想定:
 - 学習用特徴量:
-  data/features/entry/<DAY|NIGHT>/<YEAR>/<YYYY-MM-DD>.parquet
+  data/features/entry/<YEAR>/<YYYY-MM-DD>-<DAY|NIGHT>.parquet
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+from pathlib import Path
 from typing import Iterable
 
 import polars as pl
@@ -54,24 +55,26 @@ def iter_nk225_bar_files(bar_base_dir: str) -> Iterable[str]:
         "bars",
         "nk225_30s",
         "*",
-        "*",
         "*.parquet",
     )
     return sorted(glob.glob(pattern))
 
 
-def extract_session_type_from_nk225_path(file_path: str) -> str:
+def parse_date_and_session(filepath: str) -> tuple[str, str]:
     """
-    NK225 bar parquet のパスから session_type を抽出します。
+    parquet ファイル名から取引日と session_type を抽出します。
 
     Args:
-        file_path (str): NK225 parquet ファイルパス
+        filepath (str): parquet ファイルパス
 
     Returns:
-        str: "DAY" または "NIGHT"
+        tuple[str, str]: (YYYY-MM-DD, DAY|NIGHT)
     """
-    # .../bars/nk225_30s/<SESSION>/<YEAR>/<YYYY-MM-DD>.parquet
-    return os.path.basename(os.path.dirname(os.path.dirname(file_path)))
+    stem = Path(filepath).stem
+    # 右から最初の '-' で分割します。
+    # 例: 2018-01-04-DAY -> ("2018-01-04", "DAY")
+    date_str, session = stem.rsplit("-", 1)
+    return date_str, session
 
 
 def extract_year_from_path(file_path: str) -> str:
@@ -85,19 +88,6 @@ def extract_year_from_path(file_path: str) -> str:
         str: 年文字列
     """
     return os.path.basename(os.path.dirname(file_path))
-
-
-def extract_trade_date_from_path(file_path: str) -> str:
-    """
-    parquet ファイルパスから YYYY-MM-DD を抽出します。
-
-    Args:
-        file_path (str): parquet ファイルパス
-
-    Returns:
-        str: 取引日文字列
-    """
-    return os.path.splitext(os.path.basename(file_path))[0]
 
 
 def build_external_file_path(
@@ -125,9 +115,8 @@ def build_external_file_path(
         "bars",
         "external_30s",
         symbol,
-        session_type,
         year_str,
-        f"{trade_date_str}.parquet",
+        f"{trade_date_str}-{session_type}.parquet",
     )
 
 
@@ -210,14 +199,13 @@ def save_feature_parquet(
         output_base_dir,
         "features",
         "entry",
-        session_type,
         year_str,
     )
     os.makedirs(out_dir, exist_ok=True)
 
-    out_path = os.path.join(out_dir, f"{trade_date_str}.parquet")
-    
-    # sink_parquet を使用してストリーミング処理で書き出します
+    out_path = os.path.join(out_dir, f"{trade_date_str}-{session_type}.parquet")
+
+    # sink_parquet を使用してストリーミング処理で書き出します。
     feature_lf.sort("bar_start_jst").sink_parquet(
         out_path,
         compression="zstd",
@@ -242,9 +230,8 @@ def process_one_nk225_file(
         symbol_map (dict[str, str]): features.py に渡す prefix -> 実ファイル上の symbol 名
         label_horizon (int): ラベル horizon。本数単位
     """
-    session_type = extract_session_type_from_nk225_path(nk225_file_path)
     year_str = extract_year_from_path(nk225_file_path)
-    trade_date_str = extract_trade_date_from_path(nk225_file_path)
+    trade_date_str, session_type = parse_date_and_session(nk225_file_path)
 
     print(f"Scanning NK225: {nk225_file_path}")
 
@@ -258,9 +245,12 @@ def process_one_nk225_file(
         symbol_map=symbol_map,
     )
 
-    # 全ての外部指標が揃っていない場合は処理をスキップして出力しない
+    # 全ての外部指標が揃っていない場合は処理をスキップして出力しません。
     if len(external_lfs) < len(symbol_map):
-        print(f"  [SKIP] 外部指標が揃っていません ({len(external_lfs)}/{len(symbol_map)})。特徴量の出力をスキップします。")
+        print(
+            f"  [SKIP] 外部指標が揃っていません "
+            f"({len(external_lfs)}/{len(symbol_map)})。特徴量の出力をスキップします。"
+        )
         return
 
     print("  -> Building execution plan for features and labels...")
@@ -317,8 +307,7 @@ def filter_nk225_files(
     filtered: list[str] = []
 
     for path in files:
-        trade_date_str = extract_trade_date_from_path(path)
-        current_session_type = extract_session_type_from_nk225_path(path)
+        trade_date_str, current_session_type = parse_date_and_session(path)
 
         if date_from is not None and trade_date_str < date_from:
             continue
@@ -369,7 +358,7 @@ def main() -> None:
     parser.add_argument(
         "--label-horizon",
         type=int,
-        default=240,  # 2時間後の効率比ラベル (30秒足で240本) にデフォルト変更
+        default=240,  # 2時間後の効率比ラベル (30秒足で240本) を既定値にします。
         help="ラベル生成に使う未来参照本数。30秒足なので 60=30分, 120=60分, 240=120分。",
     )
     parser.add_argument(

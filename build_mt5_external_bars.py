@@ -15,7 +15,7 @@ Saver.cs が出力する週次TSV/TSV.gz
   - timestamp 形式: yyyy-MM-dd HH:mm:ss.fff
 
 出力フォーマット:
-  data/bars/external_30s/<SYMBOL>/<DAY|NIGHT>/<YEAR>/<YYYY-MM-DD>.parquet
+  data/bars/external_30s/<SYMBOL>/<YEAR>/<YYYY-MM-DD>-<DAY|NIGHT>.parquet
 """
 
 import argparse
@@ -109,7 +109,7 @@ def load_mt5_ticks(file_path: str, symbol: str | None = None) -> pl.DataFrame:
 
     Returns:
         pl.DataFrame: 正規化済みティック DataFrame (trade_ts, bid, ask, mid, spread等を含む)
-    
+
     Raises:
         ValueError: TSVに必要な列（最低3列）が不足している場合
     """
@@ -254,7 +254,10 @@ def build_30s_bars_from_ticks(tick_df: pl.DataFrame) -> pl.DataFrame:
 
 def save_daily_bars(bar_df: pl.DataFrame, output_base_dir: str) -> None:
     """
-    30秒足 DataFrame を日次・セッションタイプ (DAY/NIGHT) ごとにパーティショニングして保存します。
+    30秒足 DataFrame を日次・セッションタイプ (DAY/NIGHT) ごとに保存します。
+
+    保存先フォーマット:
+      data/bars/external_30s/<SYMBOL>/<YEAR>/<YYYY-MM-DD>-<DAY|NIGHT>.parquet
 
     Args:
         bar_df (pl.DataFrame): 30秒足 DataFrame
@@ -274,10 +277,9 @@ def save_daily_bars(bar_df: pl.DataFrame, output_base_dir: str) -> None:
             "bars",
             "external_30s",
             symbol,
-            session_type,
             year_str,
         )
-        out_path = os.path.join(out_dir, f"{trade_date_str}.parquet")
+        out_path = os.path.join(out_dir, f"{trade_date_str}-{session_type}.parquet")
 
         os.makedirs(out_dir, exist_ok=True)
         group.sort("bar_start_jst").write_parquet(

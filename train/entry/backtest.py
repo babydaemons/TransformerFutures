@@ -18,6 +18,7 @@ import glob
 import os
 import logging
 from typing import List, Dict, Tuple
+
 import numpy as np
 import polars as pl
 import torch
@@ -33,7 +34,7 @@ def simulate_trades(
     prob_threshold: float,
     hold_horizon: int = 240,
     sl_ticks: int = 10,  # 損切り幅 (日経ミニなら 10 tick = 50円幅 = -5000円)
-    tp_ticks: int = 20   # 利食い幅 (日経ミニなら 20 tick = 100円幅 = +10000円)
+    tp_ticks: int = 20,  # 利食い幅 (日経ミニなら 20 tick = 100円幅 = +10000円)
 ) -> Tuple[float, List[dict]]:
     """
     1セッション分のデータフレームでトレードをシミュレーションします。
@@ -49,7 +50,7 @@ def simulate_trades(
         Tuple[float, List[dict]]: セッションの合計損益(円)と、トレード履歴のリスト
     """
     MULTIPLIER = 100  # 日経225ミニの乗数
-    COST_YEN = 15     # 往復コスト（円）
+    COST_YEN = 80     # 往復コスト（円）
 
     # 状態管理
     position = 0      # 1: Long, -1: Short, 0: None
@@ -107,19 +108,21 @@ def simulate_trades(
                 else:
                     reason = "TP" if hit_tp else "SL"
 
-                # 損益計算（ティック差分 × 乗数 - コスト）
+                # 損益計算（価格差 × 建玉方向 × 乗数 - 往復コスト）
                 trade_pnl = ((exit_price - entry_price) * position * MULTIPLIER) - COST_YEN
                 session_pnl += trade_pnl
-                trades.append({
-                    "entry_time": entry_time,
-                    "exit_time": timestamps[i],
-                    "direction": "LONG" if position == 1 else "SHORT",
-                    "entry_price": entry_price,
-                    "exit_price": exit_price,
-                    "pnl": trade_pnl,
-                    "reason": reason,
-                    "prob": entry_prob,
-                })
+                trades.append(
+                    {
+                        "entry_time": entry_time,
+                        "exit_time": timestamps[i],
+                        "direction": "LONG" if position == 1 else "SHORT",
+                        "entry_price": entry_price,
+                        "exit_price": exit_price,
+                        "pnl": trade_pnl,
+                        "reason": reason,
+                        "prob": entry_prob,
+                    }
+                )
 
                 position = 0
                 bars_held = 0
@@ -151,7 +154,7 @@ def evaluate_window(
     device: torch.device,
     prob_threshold: float,
     sl_ticks: int,
-    tp_ticks: int
+    tp_ticks: int,
 ) -> List[dict]:
     """
     1つのWalk-Forwardウィンドウでモデルをロードし、テストデータでバックテストを行います。
@@ -228,18 +231,22 @@ def evaluate_window(
         pad = [None] * (seq_len - 1)
         full_preds = pad + preds
 
-        df = df.with_columns([
-            pl.Series("prob", full_preds, dtype=pl.Float32),
-            # 事前に保存しておいた絶対価格を復元用に使用する
-            # 累積和ベースの復元で起こり得るオフバイワンやGAP起因の累積誤差を避ける。
-            pl.col("raw_open_abs").alias("raw_open"),
-            pl.col("raw_high_abs").alias("raw_high"),
-            pl.col("raw_low_abs").alias("raw_low"),
-            pl.col("raw_close_abs").alias("raw_close"),
-        ]).with_columns([
-            # トリガー用に直近5分間（10本）の価格変化（モメンタム）を計算
-            (pl.col("raw_close") - pl.col("raw_close").shift(10)).alias("momentum"),
-        ])
+        df = df.with_columns(
+            [
+                pl.Series("prob", full_preds, dtype=pl.Float32),
+                # 事前に保存しておいた絶対価格を復元用に使用する
+                # 累積和ベースの復元で起こり得るオフバイワンやGAP起因の累積誤差を避ける。
+                pl.col("raw_open_abs").alias("raw_open"),
+                pl.col("raw_high_abs").alias("raw_high"),
+                pl.col("raw_low_abs").alias("raw_low"),
+                pl.col("raw_close_abs").alias("raw_close"),
+            ]
+        ).with_columns(
+            [
+                # トリガー用に直近5分間（10本）の価格変化（モメンタム）を計算
+                (pl.col("raw_close") - pl.col("raw_close").shift(10)).alias("momentum"),
+            ]
+        )
 
         # シミュレーション実行
         _, trades = simulate_trades(
@@ -267,9 +274,8 @@ def main():
         ],
     )
 
-    """バックテスト実行のエントリーポイント。"""
     parser = argparse.ArgumentParser(description="Transformerハイブリッド戦略のバックテスト")
-    parser.add_argument("--feature-dir", type=str, default="data/features/entry/*/*/*.parquet")
+    parser.add_argument("--feature-dir", type=str, default="data/features/entry/*/*.parquet")
     parser.add_argument("--model-dir", type=str, default="data/entry")
     parser.add_argument("--seq-len", type=int, default=60)
     parser.add_argument("--train-days", type=int, default=120)
@@ -291,24 +297,24 @@ def main():
     logging.info("Starting Backtest...")
 
     for end_idx in range(total_required, len(sorted_files) + 1):
-        window_files = sorted_files[end_idx - total_required:end_idx]
-        test_files = window_files[-args.test_days:]
-        train_files = window_files[:args.train_days]
+        window_files = sorted_files[end_idx - total_required : end_idx]
+        test_files = window_files[-args.test_days :]
+        train_files = window_files[: args.train_days]
 
-        test_date = os.path.splitext(os.path.basename(test_files[0]))[0]
+        test_file_stem = os.path.splitext(os.path.basename(test_files[0]))[0]
+        test_date, session_type = test_file_stem.rsplit("-", 1)
         if args.start and test_date < args.start:
             continue
 
         # 対応する学習済みモデルのパスを推測（train.pyと同じロジック）
-        session_type = os.path.basename(os.path.dirname(os.path.dirname(test_files[0])))
         year_str = os.path.basename(os.path.dirname(test_files[0]))
-        model_path = os.path.join(args.model_dir, session_type, year_str, f"{test_date}.pth")
+        model_path = os.path.join(args.model_dir, year_str, f"{test_date}-{session_type}.pth")
 
         if not os.path.exists(model_path):
             logging.warning(f"Model not found for {test_date}: {model_path}")
             continue
 
-        logging.info(f"Evaluating Date: {test_date} ...")
+        logging.info(f"Evaluating Date: {test_date} ({session_type}) ...")
         trades = evaluate_window(
             train_files,
             test_files,

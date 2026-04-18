@@ -12,6 +12,12 @@ File: train/entry/train.py
 時系列のスライディングウィンドウごとにモデルの学習と評価を繰り返し実行します。
 テスト時には、ROC AUCスコアや上位パーセンタイルにおけるトレンド発生確率といった
 実運用における優位性（エッジ）を評価します。
+
+入力想定:
+- data/features/entry/<YEAR>/<YYYY-MM-DD>-<DAY|NIGHT>.parquet
+
+出力想定:
+- data/entry/<YEAR>/<YYYY-MM-DD>-<DAY|NIGHT>.pth
 """
 
 import argparse
@@ -57,29 +63,29 @@ def train_epoch(
     """
     model.train()
     total_loss = 0.0
-    
+
     for batch_x, batch_y in dataloader:
         batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-        
+
         optimizer.zero_grad()
-        
+
         # 順伝播
         outputs = model(batch_x)
-        
+
         # 損失計算: outputsは (Batch, 1), batch_yは (Batch,) なので次元を合わせる
         target = batch_y.unsqueeze(-1) if batch_y.dim() == 1 else batch_y
         loss = criterion(outputs, target)
-        
+
         # 逆伝播と重み更新
         loss.backward()
-        
+
         # 勾配爆発を防ぐためのクリッピング（Transformerの学習安定化に必須）
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
+
         optimizer.step()
-        
+
         total_loss += loss.item() * batch_x.size(0)
-        
+
     return total_loss / len(dataloader.dataset)
 
 
@@ -103,93 +109,91 @@ def validate_epoch(
     """
     model.eval()
     total_loss = 0.0
-    
+
     with torch.no_grad():
         for batch_x, batch_y in dataloader:
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-            
+
             outputs = model(batch_x)
-            
+
             # 損失計算: 次元を合わせて計算
             target = batch_y.unsqueeze(-1) if batch_y.dim() == 1 else batch_y
             loss = criterion(outputs, target)
-            
+
             total_loss += loss.item() * batch_x.size(0)
-            
+
     return total_loss / len(dataloader.dataset)
 
 
-def build_output_model_path(base_dir: str, target_file_path: str) -> str:
+def build_output_model_path(
+    base_dir: str,
+    year_str: str,
+    date_str: str,
+    session_type: str,
+) -> str:
     """
-    出力先モデルパスを、対象 parquet の日付・セッション種別から構築します。
+    出力先モデルパスを、年・日付・セッション種別から構築します。
 
     出力形式:
-        <base_dir>/entry/<SESSION>/<YEAR>/<YYYY-MM-DD>.pth
+        <base_dir>/entry/<YEAR>/<YYYY-MM-DD>-<DAY|NIGHT>.pth
 
     Args:
-        base_dir (str): ベースディレクトリ (例: "data")
-        target_file_path (str): 対象ファイルパス (例: data/features/entry/DAY/2018/2018-01-04.parquet)
+        base_dir (str): ベースディレクトリ。
+        year_str (str): 年文字列。
+        date_str (str): 取引日 (YYYY-MM-DD)。
+        session_type (str): セッション種別 (DAY または NIGHT)。
 
     Returns:
-        str: 保存先の .pth パス
+        str: 保存先の .pth パス。
     """
-    normalized = Path(target_file_path)
-
-    # .../entry/<SESSION>/<YEAR>/<YYYY-MM-DD>.parquet を想定
-    trade_date_str = normalized.stem
-    year_str = normalized.parent.name
-    session_type = normalized.parent.parent.name
-
-    out_dir = os.path.join(
-        base_dir,
-        "entry",
-        session_type,
-        year_str,
-    )
-    os.makedirs(out_dir, exist_ok=True)
-
-    return os.path.join(
-        out_dir,
-        f"{trade_date_str}.pth",
-    )
+    out_dir = Path(base_dir) / "entry" / year_str
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return str(out_dir / f"{date_str}-{session_type}.pth")
 
 
 def main():
     """コマンドライン引数を解析し、モデルの学習・テストパイプライン全体を実行します。"""
-    
+
     # ==========================================
     # 1. ログと引数の設定
     # ==========================================
     os.makedirs("logs", exist_ok=True)
     log_file = os.path.join("logs", datetime.now().strftime("%Y%m%d-%H%M") + ".log")
-    
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
             logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler()
-        ]
+            logging.StreamHandler(),
+        ],
     )
 
     parser = argparse.ArgumentParser(description="Transformerモデルの学習を実行します。")
-    parser.add_argument("--feature-dir", type=str, default="data/features/entry/*/*/*.parquet", help="特徴量Parquetのパスパターン")
+    parser.add_argument(
+        "--feature-dir",
+        type=str,
+        default="data/features/entry/*/*.parquet",
+        help="特徴量Parquetのパスパターン",
+    )
     parser.add_argument("--epochs", type=int, default=50, help="最大学習エポック数")
     parser.add_argument("--batch-size", type=int, default=256, help="バッチサイズ")
     parser.add_argument("--seq-len", type=int, default=60, help="シーケンス長（過去の足の本数）")
     parser.add_argument("--lr", type=float, default=1e-4, help="初期学習率")
     parser.add_argument("--patience", type=int, default=7, help="Early Stoppingが発動するまでのエポック数")
     parser.add_argument(
-        "--out-base-dir", type=str, default="data",
-        help="モデル出力ベースディレクトリ。実際の保存先は data/entry/<DAY|NIGHT>/<YEAR>/<DATE>.pth"
+        "--out-base-dir",
+        type=str,
+        default="data",
+        help="モデル出力ベースディレクトリ。実際の保存先は data/entry/<YEAR>/<DATE>-<DAY|NIGHT>.pth",
     )
-    
+
     # データ分割の設定（例: 学習60日、検証20日、テスト5日）
     parser.add_argument("--train-days", type=int, default=60, help="学習データの日数")
     parser.add_argument("--valid-days", type=int, default=20, help="検証データの日数")
     parser.add_argument("--test-days", type=int, default=5, help="テストデータの日数")
     parser.add_argument("--start", type=str, default=None, help="処理を開始するテスト対象日 (YYYY-MM-DD)")
-    
+
     args = parser.parse_args()
 
     # デバイスの設定
@@ -205,30 +209,33 @@ def main():
         return
 
     logging.info(f"Found {len(all_files)} feature files. Starting Walk-Forward Validation...")
-    
+
     # 時系列を 1 回だけ分割するのではなく、
     # test 窓を 1 日ずつ前へ進めながらループ処理します。
     total_required = args.train_days + args.valid_days + args.test_days
     sorted_feature_files = sorted(all_files)
-    
+
     if len(sorted_feature_files) < total_required:
         raise ValueError(
             f"Not enough feature files. required={total_required}, actual={len(sorted_feature_files)}"
         )
 
     for end_idx in range(total_required, len(sorted_feature_files) + 1):
-        window_files = sorted_feature_files[end_idx - total_required : end_idx]
-        
+        window_files = sorted_feature_files[end_idx - total_required: end_idx]
+
         # 現在のウィンドウの末尾（test_days分）がテスト対象のファイル
         test_files = window_files[-args.test_days:]
         if not test_files:
             continue
-            
+
+        # ファイル名 <YYYY-MM-DD>-<DAY|NIGHT>.parquet から日付とセッションを抽出します。
+        test_file_stem = Path(test_files[0]).stem
+        test_target_date, session_type = test_file_stem.rsplit("-", 1)
+
         # 開始日が指定されている場合、テスト対象日がそれより前なら処理コストを省くためスキップ
-        test_target_date = Path(test_files[0]).stem
         if args.start and test_target_date < args.start:
             continue
-         
+
         # SeqLen未満のファイルに起因する例外などをキャッチし、該当ウィンドウをスキップする
         try:
             train_loader, valid_loader, test_loader, num_features = create_dataloaders(
@@ -243,9 +250,12 @@ def main():
             logging.warning(f"Skipping window ending at {window_files[-1]}: {e}")
             continue
 
+        year_str = Path(test_files[0]).parts[-2]
         out_model_path = build_output_model_path(
-            base_dir=args.out_base_dir,
-            target_file_path=test_files[0],
+            args.out_base_dir,
+            year_str,
+            test_target_date,
+            session_type,
         )
 
         logging.info(f"Current test target: {test_files[0]}")
@@ -270,9 +280,9 @@ def main():
         # 不均衡データ（トレンド発生確率が低い）対策としてポジティブサンプルに重みを付けます
         pos_weight = torch.tensor([4.0]).to(device)  # 発生確率が約20%なら4.0程度が目安
         criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-        
+
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-        
+
         # 検証Lossが改善しなくなった場合に学習率を1/2に下げる
         scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
 
@@ -284,15 +294,15 @@ def main():
 
         for epoch in range(1, args.epochs + 1):
             epoch_start = time.time()
-            
+
             train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
             valid_loss = validate_epoch(model, valid_loader, criterion, device)
-            
+
             prev_lr = optimizer.param_groups[0]["lr"]
             scheduler.step(valid_loss)
             current_lr = optimizer.param_groups[0]["lr"]
             epoch_duration = time.time() - epoch_start
-            
+
             logging.info(
                 f"Epoch {epoch:03d}/{args.epochs:03d} | "
                 f"Train Loss: {train_loss:.6f} | Valid Loss: {valid_loss:.6f} | "
@@ -301,7 +311,7 @@ def main():
 
             if current_lr != prev_lr:
                 logging.info(f"  -> Learning rate changed: {prev_lr:.8f} -> {current_lr:.8f}")
-            
+
             # Early Stopping とモデル保存の判定
             if valid_loss < best_valid_loss:
                 best_valid_loss = valid_loss
@@ -310,7 +320,7 @@ def main():
                 logging.info(f"  -> Best model saved to: {out_model_path}")
             else:
                 epochs_no_improve += 1
-                
+
             if epochs_no_improve >= args.patience:
                 logging.info("Early stopping triggered.")
                 break
@@ -325,7 +335,7 @@ def main():
             weights_only=True,
         )
         model.load_state_dict(state_dict)
-        
+
         # ====== トレード向けのビジネス指標評価 ======
         model.eval()
         test_loss = 0.0
@@ -336,39 +346,39 @@ def main():
             for batch_x, batch_y in test_loader:
                 batch_x, batch_y = batch_x.to(device), batch_y.to(device)
                 outputs = model(batch_x)
-                
+
                 target = batch_y.unsqueeze(-1) if batch_y.dim() == 1 else batch_y
                 loss = criterion(outputs, target)
                 test_loss += loss.item() * batch_x.size(0)
-                
+
                 # ロジットをSigmoidに通して確率(0.0~1.0)に変換して保存
                 probs = torch.sigmoid(outputs).cpu().numpy().flatten()
                 all_preds.extend(probs)
                 all_trues.extend(batch_y.cpu().numpy().flatten())
-                
+
         test_loss /= len(test_loader.dataset)
         logging.info(f"Final Test Loss: {test_loss:.6f}")
-        
+
         preds_np = np.array(all_preds)
         trues_np = np.array(all_trues)
-        
+
         # 予測のエッジ（優位性）の定量的評価
         if len(preds_np) > 1:
             # ROC AUCの計算 (正例と負例が両方存在する場合のみ)
             if len(np.unique(trues_np)) > 1:
                 auc = roc_auc_score(trues_np, preds_np)
                 logging.info(f"# ROC AUC Score: {auc:.4f}")
-            
-            threshold = np.percentile(preds_np, 80) # 上位20%の予測スコア閾値
+
+            threshold = np.percentile(preds_np, 80)  # 上位20%の予測スコア閾値
             high_conf_idx = preds_np >= threshold
-            
+
             baseline_prob = trues_np.mean()
             top20_prob = trues_np[high_conf_idx].mean() if high_conf_idx.sum() > 0 else 0.0
-            
+
             logging.info(f"# Baseline Trend Prob: {baseline_prob * 100:.2f}%")
             logging.info(f"# Top 20% Trend Prob:  {top20_prob * 100:.2f}%")
             logging.info(f"# Edge (Improvement):  {(top20_prob - baseline_prob) * 100:.2f}%")
-            
+
         logging.info("-" * 80)
 
 
