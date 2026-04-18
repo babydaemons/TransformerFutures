@@ -391,11 +391,20 @@ def main():
                 logging.info(f"# Top 20% Trend Prob:  {top20_prob * 100:.2f}%")
                 logging.info(f"# Edge (Improvement):  {edge_pct:.2f}%")
 
-                # エッジ（優位性）の数値をJSONファイルとしてモデルと同じ階層に出力
+                # JSONL形式での出力 (cat *.json > history.jsonl でそのまま使える形式)
+                # ファイル名 (2020-02-04-DAY.pth) から日付とセッションを復元
+                stem = Path(out_model_path).stem
+                date_str, session_str = stem.rsplit("-", 1)
                 json_path = os.path.splitext(out_model_path)[0] + ".json"
-                with open(json_path, "w", encoding="utf-8") as file_obj:
-                    # 指定のフォーマット通り小数点2桁で丸めて出力
-                    json.dump({"edge": round(float(edge_pct), 2)}, file_obj)
+
+                with open(json_path, "w", encoding="utf-8") as f:
+                    record = {
+                        "date": f"{date_str}T00:00:00+09:00",
+                        "session": session_str,
+                        "edge": round(float(edge_pct), 2),
+                    }
+                    # 1行のJSONとして書き出し、末尾に改行を付与
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
             logging.info("-" * 80)
 
