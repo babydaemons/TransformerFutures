@@ -58,7 +58,8 @@ fi
     pytorch::pytorch-cuda=11.8 \
     "numpy<2.0" \
     ipykernel \
-    numba
+    numba \
+    matplotlib
 
 echo ">>> 3. Creating activation script..."
 
