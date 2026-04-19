@@ -9,12 +9,15 @@ File: train/entry/backtest.py
 新たにSL(Stop Loss)およびTP(Take Profit)のティックベースでのエグジットロジック、
 および決済直後の連続エントリーを防止するクールダウン（待機期間）機能が組み込まれています。
 また、特徴量生成前に保存しておいた絶対価格列を用いて、バックテスト用の価格を正確に復元します。
+さらに、学習時に出力した edge 情報のJSONを参照し、指定したエッジ(%)を上回るモデルのみを
+バックテスト対象に絞り込むフィルタリング機能を提供します。
 バックテスト終了後には、matplotlibを用いてエクイティカーブ（資産曲線）を描画・保存します。
 """
 
 import argparse
 from datetime import datetime
 import glob
+import json
 import os
 import logging
 from typing import List, Dict, Tuple
@@ -32,9 +35,9 @@ from train.entry.dataset import SessionSequenceDataset, compute_train_statistics
 def simulate_trades(
     df: pl.DataFrame,
     prob_threshold: float,
-    hold_horizon: int = 240,
-    sl_ticks: int = 10,  # 損切り幅 (日経ミニなら 10 tick = 50円幅 = -5000円)
-    tp_ticks: int = 20,  # 利食い幅 (日経ミニなら 20 tick = 100円幅 = +10000円)
+    hold_horizon: int = 720,
+    sl_ticks: int = 100,  # 損切り幅 (日経ミニなら 100 tick = 100円幅 = -10000円)
+    tp_ticks: int = 250,  # 利食い幅 (日経ミニなら 250 tick = 100円幅 = +25000円)
 ) -> Tuple[float, List[dict]]:
     """
     1セッション分のデータフレームでトレードをシミュレーションします。
@@ -285,6 +288,7 @@ def main():
     parser.add_argument("--prob-threshold", type=float, default=0.6, help="エントリーを許可するAIの確率閾値")
     parser.add_argument("--sl-ticks", type=int, default=10, help="損切り幅(ティック数: 1tick=5円)")
     parser.add_argument("--tp-ticks", type=int, default=20, help="利食い幅(ティック数: 1tick=5円)")
+    parser.add_argument("--edge", type=float, default=None, help="指定したエッジ(%)を超える場合のみバックテストを実行する")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -309,10 +313,32 @@ def main():
         # 対応する学習済みモデルのパスを推測（train.pyと同じロジック）
         year_str = os.path.basename(os.path.dirname(test_files[0]))
         model_path = os.path.join(args.model_dir, year_str, f"{test_date}-{session_type}.pth")
+        json_path = os.path.join(args.model_dir, year_str, f"{test_date}-{session_type}.json")
 
         if not os.path.exists(model_path):
             logging.warning(f"Model not found for {test_date}: {model_path}")
             continue
+
+        # --- エッジによるフィルタリング ---
+        if args.edge is not None:
+            if not os.path.exists(json_path):
+                logging.warning(f"JSON not found for {test_date}, skipping due to --edge filter: {json_path}")
+                continue
+
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    record = json.loads(f.read().strip())
+                    edge_val = record.get("edge", 0.0)
+
+                if edge_val <= args.edge:
+                    logging.info(
+                        f"Skipping {test_date} ({session_type}): "
+                        f"Edge ({edge_val}%) <= Threshold ({args.edge}%)"
+                    )
+                    continue
+            except Exception as e:
+                logging.error(f"Failed to read edge from {json_path}: {e}")
+                continue
 
         logging.info(f"Evaluating Date: {test_date} ({session_type}) ...")
         trades = evaluate_window(
