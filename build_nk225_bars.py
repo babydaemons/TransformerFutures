@@ -86,12 +86,13 @@ def classify_session_type_from_bar_start(bar_start_col: pl.Expr) -> pl.Expr:
     ).then(pl.lit("DAY")).otherwise(pl.lit("NIGHT"))
 
 
-def build_30s_bars_from_raw(raw_df: pl.DataFrame) -> pl.DataFrame:
+def build_30s_bars_from_raw(raw_df: pl.DataFrame, trade_date_str: str) -> pl.DataFrame:
     """
     raw データを 30秒足へ集約します。
 
     Args:
         raw_df (pl.DataFrame): raw parquet 由来の DataFrame
+        trade_date_str (str): JPXのTrade_Date文字列（YYYY-MM-DD）
 
     Returns:
         pl.DataFrame: 30秒足に集約された DataFrame
@@ -105,10 +106,13 @@ def build_30s_bars_from_raw(raw_df: pl.DataFrame) -> pl.DataFrame:
         return pl.DataFrame()
 
     # bar 開始時刻を 30秒単位で切り下げて集約ベースを作成
+    # session_date_jst は bar_start_jst 由来ではなく、
+    # JPXのTrade_Dateをそのまま採用してNIGHTセッションの日付分断を防ぎます。
     bar_df = (
         raw_df.with_columns(
             [
                 pl.col("trade_ts").dt.truncate(f"{BAR_SECONDS}s").alias("bar_start_jst"),
+                pl.lit(trade_date_str).str.strptime(pl.Date, "%Y-%m-%d").alias("session_date_jst"),
                 (pl.col("price") * pl.col("trade_volume")).alias("turnover"),
             ]
         )
@@ -194,28 +198,29 @@ def build_30s_bars_from_raw(raw_df: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def save_daily_bars(bar_df: pl.DataFrame, output_base_dir: str) -> None:
+def save_daily_bars(bar_df: pl.DataFrame, output_base_dir: str, trade_date_str: str) -> None:
     """
     30秒足 DataFrame を session_type ごとに 1日1ファイルで保存します。
 
     Args:
         bar_df (pl.DataFrame): 30秒足 DataFrame
         output_base_dir (str): 出力ベースディレクトリ
+        trade_date_str (str): JPXのTrade_Date文字列（YYYY-MM-DD）
+
+    Notes:
+        JPXのTrade_Dateベースで保存します。
+        これにより、NIGHTセッションが bar_start_jst の暦日で分断されることを防ぎます。
     """
     if bar_df.is_empty():
         return
 
-    # 日付とセッションタイプ単位でデータを分割
-    grouped = bar_df.partition_by(["session_date_jst", "session_type"], as_dict=True)
-    for key, group in grouped.items():
-        if isinstance(key, tuple):
-            trade_date = key[0]
-            session_type = key[1]
-        else:
-            trade_date, session_type = key
+    year_str = trade_date_str[:4]
 
-        year_str = trade_date.strftime("%Y")
-        trade_date_str = trade_date.strftime("%Y-%m-%d")
+    # session_type 単位で分割し、Trade_Date をそのままファイル名に採用する
+    grouped = bar_df.partition_by("session_type", as_dict=True)
+    for session_type, group in grouped.items():
+        if isinstance(session_type, tuple):
+            session_type = session_type[0]
 
         out_dir = os.path.join(
             output_base_dir,
@@ -248,12 +253,15 @@ def process_one_file(file_path: str, output_base_dir: str) -> None:
         print("  -> empty")
         return
 
-    bar_df = build_30s_bars_from_raw(raw_df)
+    # Raw Parquetのファイル名はJPXの正しいTrade_Dateになっている
+    trade_date_str = os.path.splitext(os.path.basename(file_path))[0]
+
+    bar_df = build_30s_bars_from_raw(raw_df, trade_date_str)
     if bar_df.is_empty():
         print("  -> no bars")
         return
 
-    save_daily_bars(bar_df, output_base_dir)
+    save_daily_bars(bar_df, output_base_dir, trade_date_str)
 
 
 def main() -> None:

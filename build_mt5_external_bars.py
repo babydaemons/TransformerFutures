@@ -57,6 +57,32 @@ def classify_session_type_from_bar_start(bar_start_col: pl.Expr) -> pl.Expr:
     ).then(pl.lit("DAY")).otherwise(pl.lit("NIGHT"))
 
 
+def add_jpx_session_date(df: pl.DataFrame) -> pl.DataFrame:
+    """
+    bar_start_jst から JPX 基準の取引日 (session_date_jst) を推論します。
+    16:00以降のデータは翌営業日（金曜なら翌週の月曜）のNIGHTセッションとして扱います。
+
+    Args:
+        df (pl.DataFrame): bar_start_jst を含む30秒足 DataFrame
+
+    Returns:
+        pl.DataFrame: session_date_jst 列を付与した DataFrame
+    """
+    # Polarsのweekday: 1=月曜 ... 5=金曜, 6=土曜, 7=日曜
+    return df.with_columns(
+        pl.when(pl.col("bar_start_jst").dt.hour() >= 16)
+        .then(
+            pl.when(pl.col("bar_start_jst").dt.weekday() == 5)  # 金曜
+            .then(pl.col("bar_start_jst").dt.date() + pl.duration(days=3))
+            .when(pl.col("bar_start_jst").dt.weekday() == 6)  # 土曜（念のため）
+            .then(pl.col("bar_start_jst").dt.date() + pl.duration(days=2))
+            .otherwise(pl.col("bar_start_jst").dt.date() + pl.duration(days=1))
+        )
+        .otherwise(pl.col("bar_start_jst").dt.date())
+        .alias("session_date_jst")
+    )
+
+
 def iter_mt5_tsv_files(mt5_base_dir: str, symbol: str | None = None) -> Iterable[str]:
     """
     MT5 の TSV / TSV.gz ファイル群を列挙します。
@@ -149,7 +175,7 @@ def load_mt5_ticks(file_path: str, symbol: str | None = None) -> pl.DataFrame:
                 # TSV(MT5サーバー時間)を標準的なFXブローカーのタイムゾーン(EET)とみなし、JSTへ変換
                 .dt.replace_time_zone("EET")
                 .dt.convert_time_zone("Asia/Tokyo")
-                .dt.replace_time_zone(None) # タイムゾーン情報を落としてnaive datetimeに戻す
+                .dt.replace_time_zone(None)  # タイムゾーン情報を落としてnaive datetimeに戻す
                 .alias("trade_ts"),
                 pl.col("bid").cast(pl.Float64, strict=False).alias("bid"),
                 pl.col("ask").cast(pl.Float64, strict=False).alias("ask"),
@@ -220,13 +246,14 @@ def build_30s_bars_from_ticks(tick_df: pl.DataFrame) -> pl.DataFrame:
         .with_columns(
             [
                 (pl.col("bar_start_jst") + pl.duration(seconds=BAR_SECONDS)).alias("bar_end_jst"),
-                pl.col("bar_start_jst").dt.date().alias("session_date_jst"),
                 classify_session_type_from_bar_start(pl.col("bar_start_jst")).alias("session_type"),
                 pl.lit(True).alias("is_complete"),
             ]
         )
         .sort(["symbol", "bar_start_jst"])
     )
+
+    bar_df = add_jpx_session_date(bar_df)
 
     # 外部指標の OHLC は mid ベースを採用
     return bar_df.select(
@@ -252,9 +279,9 @@ def build_30s_bars_from_ticks(tick_df: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def save_daily_bars(bar_df: pl.DataFrame, output_base_dir: str) -> None:
+def save_daily_bars(bar_df: pl.DataFrame, output_base_dir: str, symbol: str) -> None:
     """
-    30秒足 DataFrame を日次・セッションタイプ (DAY/NIGHT) ごとに保存します。
+    30秒足 DataFrame を JPX 基準の取引日・セッションタイプ (DAY/NIGHT) ごとに保存します。
 
     保存先フォーマット:
       data/bars/external_30s/<SYMBOL>/<YEAR>/<YYYY-MM-DD>-<DAY|NIGHT>.parquet
@@ -262,31 +289,25 @@ def save_daily_bars(bar_df: pl.DataFrame, output_base_dir: str) -> None:
     Args:
         bar_df (pl.DataFrame): 30秒足 DataFrame
         output_base_dir (str): 出力ベースディレクトリ (Parquetファイルが保存されるルート)
+        symbol (str): 出力対象シンボル
     """
     if bar_df.is_empty():
         return
 
-    grouped = bar_df.partition_by(["symbol", "session_date_jst", "session_type"], as_dict=True)
-    for key, group in grouped.items():
-        symbol, trade_date, session_type = key
-        year_str = trade_date.strftime("%Y")
-        trade_date_str = trade_date.strftime("%Y-%m-%d")
+    # 推論されたJPX Trade Date単位で保存
+    for keys, group in bar_df.partition_by(["session_date_jst", "session_type"], as_dict=True).items():
+        session_date_jst, session_type = keys if isinstance(keys, tuple) else (keys[0], keys[1])
 
-        out_dir = os.path.join(
-            output_base_dir,
-            "bars",
-            "external_30s",
-            symbol,
-            year_str,
-        )
-        out_path = os.path.join(out_dir, f"{trade_date_str}-{session_type}.parquet")
+        date_str = session_date_jst.strftime("%Y-%m-%d")
+        year_str = date_str[:4]
 
+        symbol_str = symbol if symbol else "UNKNOWN"
+        out_dir = os.path.join(output_base_dir, "bars", "external_30s", symbol_str, year_str)
         os.makedirs(out_dir, exist_ok=True)
-        group.sort("bar_start_jst").write_parquet(
-            out_path,
-            compression="zstd",
-        )
-        print(f"Saved: {out_path} ({len(group)} rows)")
+        out_path = os.path.join(out_dir, f"{date_str}-{session_type}.parquet")
+
+        group.write_parquet(out_path, compression="zstd")
+        print(f"  -> Saved {out_path} ({len(group)} rows)")
 
 
 def process_one_file(file_path: str, output_base_dir: str, symbol: str | None = None) -> None:
@@ -309,7 +330,8 @@ def process_one_file(file_path: str, output_base_dir: str, symbol: str | None = 
         print("  -> no bars")
         return
 
-    save_daily_bars(bar_df, output_base_dir)
+    resolved_symbol = symbol or infer_symbol_from_path(file_path)
+    save_daily_bars(bar_df, output_base_dir, resolved_symbol)
 
 
 def main() -> None:
