@@ -195,6 +195,13 @@ def main():
     parser.add_argument("--valid-days", type=int, default=20, help="検証データの日数")
     parser.add_argument("--test-days", type=int, default=5, help="テストデータの日数")
     parser.add_argument("--start", type=str, default=None, help="処理を開始するテスト対象日 (YYYY-MM-DD)")
+    parser.add_argument(
+        "--session",
+        type=str,
+        choices=["ALL", "DAY", "NIGHT"],
+        default="ALL",
+        help="学習対象のセッション (ALL, DAY, NIGHT)",
+    )
 
     args = parser.parse_args()
 
@@ -213,8 +220,9 @@ def main():
     total_required = args.train_days + args.valid_days + args.test_days
     logging.info(f"Found {len(all_feature_files)} feature files. Starting Walk-Forward Validation...")
 
-    # DAY と NIGHT でループを分けることで、学習期間内に他方のセッションが混ざらないようにする
-    for current_session in ["DAY", "NIGHT"]:
+    # 指定されたセッション（ALLの場合はDAYとNIGHT両方）でループを回す
+    target_sessions = ["DAY", "NIGHT"] if args.session == "ALL" else [args.session]
+    for current_session in target_sessions:
         # 指定されたセッションのファイルのみを抽出
         session_files = [
             file_path
