@@ -11,6 +11,8 @@ File: train/entry/backtest.py
 また、特徴量生成前に保存しておいた絶対価格列を用いて、バックテスト用の価格を正確に復元します。
 さらに、学習時に出力した edge 情報のJSONを参照し、指定したエッジ(%)を上回るモデルのみを
 バックテスト対象に絞り込むフィルタリング機能を提供します。
+加えて、1取引日ファイル内に DAY / NIGHT の両セッションが同居する構成に対応するため、
+セッション別モデルを同時に読み込み、各バーの session_type に応じて対応モデルを切り替えて推論します。
 バックテスト終了後には、matplotlibを用いてエクイティカーブ（資産曲線）を描画・保存します。
 """
 
@@ -18,9 +20,10 @@ import argparse
 from datetime import datetime
 import glob
 import json
-import os
 import logging
-from typing import List, Dict, Tuple
+import os
+from pathlib import Path
+from typing import Dict, List, Tuple
 
 import numpy as np
 import polars as pl
@@ -28,8 +31,8 @@ import torch
 from torch.utils.data import DataLoader
 
 # 既存モジュールのインポート
-from train.entry.model import TimeSeriesTransformer
 from train.entry.dataset import SessionSequenceDataset, compute_train_statistics
+from train.entry.model import TimeSeriesTransformer
 
 
 def simulate_trades(
@@ -37,23 +40,23 @@ def simulate_trades(
     prob_threshold: float,
     hold_horizon: int = 720,
     sl_ticks: int = 100,  # 損切り幅 (日経ミニなら 100 tick = 100円幅 = -10000円)
-    tp_ticks: int = 250,  # 利食い幅 (日経ミニなら 250 tick = 100円幅 = +25000円)
+    tp_ticks: int = 250,  # 利食い幅 (日経ミニなら 250 tick = 250円幅 = +25000円)
 ) -> Tuple[float, List[dict]]:
     """
     1セッション分のデータフレームでトレードをシミュレーションします。
 
     Args:
-        df (pl.DataFrame): 予測確率('prob')と価格が含まれたDataFrame
-        prob_threshold (float): エントリーを許可するAIの予測確率の閾値
-        hold_horizon (int, optional): 最大ホールド期間（足の本数）. Defaults to 240.
-        sl_ticks (int, optional): 損切りのティック数. Defaults to 10.
-        tp_ticks (int, optional): 利食いのティック数. Defaults to 20.
+        df: 予測確率('prob')と価格が含まれたDataFrame。
+        prob_threshold: エントリーを許可するAIの予測確率の閾値。
+        hold_horizon: 最大ホールド期間（足の本数）。
+        sl_ticks: 損切りのティック数。
+        tp_ticks: 利食いのティック数。
 
     Returns:
-        Tuple[float, List[dict]]: セッションの合計損益(円)と、トレード履歴のリスト
+        セッションの合計損益(円)と、トレード履歴のリスト。
     """
-    MULTIPLIER = 100  # 日経225ミニの乗数
-    COST_YEN = 80     # 往復コスト（円）
+    multiplier = 100  # 日経225ミニの乗数
+    cost_yen = 80     # 往復コスト（円）
 
     # 状態管理
     position = 0      # 1: Long, -1: Short, 0: None
@@ -62,7 +65,7 @@ def simulate_trades(
     cooldown_bars = 0  # 決済後の待機時間（足の本数）
 
     session_pnl = 0.0
-    trades = []
+    trades: List[dict] = []
 
     # PolarsからPythonのリストに変換して高速にイテレーション
     closes = df["raw_close"].to_list()
@@ -112,7 +115,7 @@ def simulate_trades(
                     reason = "TP" if hit_tp else "SL"
 
                 # 損益計算（価格差 × 建玉方向 × 乗数 - 往復コスト）
-                trade_pnl = ((exit_price - entry_price) * position * MULTIPLIER) - COST_YEN
+                trade_pnl = ((exit_price - entry_price) * position * multiplier) - cost_yen
                 session_pnl += trade_pnl
                 trades.append(
                     {
@@ -152,7 +155,7 @@ def simulate_trades(
 def evaluate_window(
     train_files: List[str],
     test_files: List[str],
-    model_path: str,
+    models_to_run: Dict[str, str],
     seq_len: int,
     device: torch.device,
     prob_threshold: float,
@@ -160,84 +163,92 @@ def evaluate_window(
     tp_ticks: int,
 ) -> List[dict]:
     """
-    1つのWalk-Forwardウィンドウでモデルをロードし、テストデータでバックテストを行います。
+    1つのWalk-Forwardウィンドウで必要なモデル群をロードし、テストデータでバックテストを行います。
 
     Args:
-        train_files (List[str]): スケーラー復元用の学習データファイルパスのリスト
-        test_files (List[str]): 評価対象となるテストデータファイルパスのリスト
-        model_path (str): ロードする学習済みPyTorchモデルのパス
-        seq_len (int): モデル入力のシーケンス長
-        device (torch.device): 推論に使用するデバイス
-        prob_threshold (float): エントリーを許可するAIの予測確率の閾値
-        sl_ticks (int): 損切りのティック数
-        tp_ticks (int): 利食いのティック数
+        train_files: スケーラー復元用の学習データファイルパスのリスト。
+        test_files: 評価対象となるテストデータファイルパスのリスト。
+        models_to_run: セッション種別をキー、モデルパスを値とする辞書。
+        seq_len: モデル入力のシーケンス長。
+        device: 推論に使用するデバイス。
+        prob_threshold: エントリーを許可するAIの予測確率の閾値。
+        sl_ticks: 損切りのティック数。
+        tp_ticks: 利食いのティック数。
 
     Returns:
-        List[dict]: 指定されたウィンドウ内での全トレード履歴
+        指定されたウィンドウ内での全トレード履歴。
     """
     # スケーラー（平均・標準偏差）をTrainから復元
     means, stds, _ = compute_train_statistics(train_files, label_col="label_efficiency_240")
 
-    # モデルのロード
-    dummy_ds = SessionSequenceDataset(
-        train_files[0],
-        seq_len=seq_len,
-        feature_means=means,
-        feature_stds=stds,
-    )
-    num_features = dummy_ds.X_data.shape[1]
+    # 存在するセッションのモデルをロードする。
+    # 現状パッチ指定に従い、入力特徴量数は固定値 101 を使用する。
+    loaded_models: Dict[str, TimeSeriesTransformer] = {}
+    for session_type, model_path in models_to_run.items():
+        try:
+            model = TimeSeriesTransformer(
+                num_features=101,
+                d_model=128,
+                nhead=8,
+                num_layers=3,
+                dim_feedforward=256,
+                dropout=0.2,
+            )
+            model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+            model.to(device)
+            model.eval()
+            loaded_models[session_type] = model
+        except Exception as e:
+            logging.error(f"Failed to load {session_type} model: {e}")
 
-    model = TimeSeriesTransformer(
-        num_features=num_features,
-        d_model=128,
-        nhead=8,
-        num_layers=3,
-        dim_feedforward=256,
-        dropout=0.2,
-    )
+    if not loaded_models:
+        return []
 
-    # 破損したモデルファイルのロードに対する例外ハンドリングを追加
-    try:
-        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-    except Exception as e:
-        logging.error(f"Failed to load model {model_path}. File might be corrupted: {e}")
-        return []  # 破損している場合はトレードなしとしてスキップ
-
-    model.to(device)
-    model.eval()
-
-    all_trades = []
+    all_trades: List[dict] = []
 
     for test_file in test_files:
         df = pl.read_parquet(test_file)
         if len(df) <= seq_len:
             continue
 
-        # データセットの作成と推論
+        # データセットの作成と推論。
+        # 1日ファイル内に DAY / NIGHT が混在し得るため、target_session="ALL" で全行を対象にする。
         dataset = SessionSequenceDataset(
             test_file,
             seq_len=seq_len,
             feature_means=means,
             feature_stds=stds,
+            target_session="ALL",
         )
         loader = DataLoader(dataset, batch_size=256, shuffle=False)
 
-        preds = []
-        with torch.no_grad():
-            for batch_x, _ in loader:
-                batch_x = batch_x.to(device)
-                outputs = model(batch_x)
-                probs = torch.sigmoid(outputs).cpu().numpy().flatten()
-                preds.extend(probs)
+        # 各有効インデックス位置へセッション別モデルの予測値を直接書き戻す。
+        # 推論不能な先頭部や対象外セッションの位置は 0.0 のまま残る。
+        full_preds = np.zeros(len(df), dtype=np.float32)
+        session_types = df["session_type"].to_list()
 
-        # 予測値をDataFrameに結合（最初の seq_len - 1 行は予測不能なので None で埋める）
-        pad = [None] * (seq_len - 1)
-        full_preds = pad + preds
+        with torch.no_grad():
+            for batch_idx, (batch_x, _) in enumerate(loader):
+                batch_x = batch_x.to(device)
+
+                start_i = batch_idx * 256
+                end_i = start_i + len(batch_x)
+                batch_indices = dataset.valid_indices[start_i:end_i]
+
+                for session_type, model in loaded_models.items():
+                    mask = [session_types[idx] == session_type for idx in batch_indices]
+                    if not any(mask):
+                        continue
+
+                    probs = torch.sigmoid(model(batch_x)).cpu().numpy().flatten()
+                    for i, idx in enumerate(batch_indices):
+                        if session_types[idx] == session_type:
+                            full_preds[idx] = probs[i]
 
         df = df.with_columns(
             [
                 pl.Series("prob", full_preds, dtype=pl.Float32),
-                # 事前に保存しておいた絶対価格を復元用に使用する
+                # 事前に保存しておいた絶対価格を復元用に使用する。
                 # 累積和ベースの復元で起こり得るオフバイワンやGAP起因の累積誤差を避ける。
                 pl.col("raw_open_abs").alias("raw_open"),
                 pl.col("raw_high_abs").alias("raw_high"),
@@ -246,7 +257,7 @@ def evaluate_window(
             ]
         ).with_columns(
             [
-                # トリガー用に直近5分間（10本）の価格変化（モメンタム）を計算
+                # トリガー用に直近5分間（10本）の価格変化（モメンタム）を計算する。
                 (pl.col("raw_close") - pl.col("raw_close").shift(10)).alias("momentum"),
             ]
         )
@@ -263,8 +274,8 @@ def evaluate_window(
     return all_trades
 
 
-def main():
-    """バックテスト実行のエントリーポイント。"""
+def main() -> None:
+    """バックテスト実行のエントリーポイントです。"""
     os.makedirs("logs", exist_ok=True)
     log_file = os.path.join("logs", datetime.now().strftime("%Y%m%d-%H%M") + ".log")
 
@@ -296,7 +307,7 @@ def main():
     sorted_files = sorted(glob.glob(args.feature_dir))
     total_required = args.train_days + args.valid_days + args.test_days
 
-    all_trades = []
+    all_trades: List[dict] = []
 
     logging.info("Starting Backtest...")
 
@@ -305,46 +316,49 @@ def main():
         test_files = window_files[-args.test_days :]
         train_files = window_files[: args.train_days]
 
-        test_file_stem = os.path.splitext(os.path.basename(test_files[0]))[0]
-        test_date, session_type = test_file_stem.rsplit("-", 1)
+        test_date = Path(test_files[0]).stem
         if args.start and test_date < args.start:
             continue
 
-        # 対応する学習済みモデルのパスを推測（train.pyと同じロジック）
         year_str = os.path.basename(os.path.dirname(test_files[0]))
-        model_path = os.path.join(args.model_dir, year_str, f"{test_date}-{session_type}.pth")
-        json_path = os.path.join(args.model_dir, year_str, f"{test_date}-{session_type}.json")
 
-        if not os.path.exists(model_path):
-            logging.warning(f"Model not found for {test_date}: {model_path}")
+        # 1取引日内の DAY / NIGHT セッションに対応するモデルを収集する。
+        models_to_run: Dict[str, str] = {}
+        for session_type in ["DAY", "NIGHT"]:
+            model_path = os.path.join(args.model_dir, year_str, f"{test_date}-{session_type}.pth")
+            json_path = os.path.join(args.model_dir, year_str, f"{test_date}-{session_type}.json")
+
+            if not os.path.exists(model_path):
+                continue
+
+            # --- エッジによるフィルタリング ---
+            if args.edge is not None:
+                if not os.path.exists(json_path):
+                    continue
+
+                try:
+                    with open(json_path, "r", encoding="utf-8") as f:
+                        edge_val = json.loads(f.read().strip()).get("edge", 0.0)
+
+                    if edge_val <= args.edge:
+                        logging.info(
+                            f"Skipping {test_date} ({session_type}): "
+                            f"Edge ({edge_val}%) <= Threshold"
+                        )
+                        continue
+                except Exception:
+                    continue
+
+            models_to_run[session_type] = model_path
+
+        if not models_to_run:
             continue
 
-        # --- エッジによるフィルタリング ---
-        if args.edge is not None:
-            if not os.path.exists(json_path):
-                logging.warning(f"JSON not found for {test_date}, skipping due to --edge filter: {json_path}")
-                continue
-
-            try:
-                with open(json_path, "r", encoding="utf-8") as f:
-                    record = json.loads(f.read().strip())
-                    edge_val = record.get("edge", 0.0)
-
-                if edge_val <= args.edge:
-                    logging.info(
-                        f"Skipping {test_date} ({session_type}): "
-                        f"Edge ({edge_val}%) <= Threshold ({args.edge}%)"
-                    )
-                    continue
-            except Exception as e:
-                logging.error(f"Failed to read edge from {json_path}: {e}")
-                continue
-
-        logging.info(f"Evaluating Date: {test_date} ({session_type}) ...")
+        logging.info(f"Evaluating Date: {test_date} ...")
         trades = evaluate_window(
             train_files,
             test_files,
-            model_path,
+            models_to_run,
             args.seq_len,
             device,
             args.prob_threshold,
@@ -359,18 +373,18 @@ def main():
         return
 
     total_trades = len(all_trades)
-    winning_trades = [t for t in all_trades if t["pnl"] > 0]
-    losing_trades = [t for t in all_trades if t["pnl"] <= 0]
+    winning_trades = [trade for trade in all_trades if trade["pnl"] > 0]
+    losing_trades = [trade for trade in all_trades if trade["pnl"] <= 0]
 
-    gross_profit = sum(t["pnl"] for t in winning_trades)
-    gross_loss = abs(sum(t["pnl"] for t in losing_trades))
+    gross_profit = sum(trade["pnl"] for trade in winning_trades)
+    gross_loss = abs(sum(trade["pnl"] for trade in losing_trades))
     net_profit = gross_profit - gross_loss
 
     win_rate = len(winning_trades) / total_trades * 100
     profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
 
     # 最大ドローダウンの計算
-    cumulative_pnl = np.cumsum([t["pnl"] for t in all_trades])
+    cumulative_pnl = np.cumsum([trade["pnl"] for trade in all_trades])
     running_max = np.maximum.accumulate(cumulative_pnl)
     drawdowns = running_max - cumulative_pnl
     max_drawdown = np.max(drawdowns)
@@ -391,7 +405,7 @@ def main():
     try:
         import matplotlib.pyplot as plt
 
-        times = [t["exit_time"] for t in all_trades]
+        times = [trade["exit_time"] for trade in all_trades]
         plt.figure(figsize=(12, 6))
         plt.plot(times, cumulative_pnl, label="Equity Curve", color="blue", linewidth=1.5)
         plt.title(f"Transformer + Momentum Strategy (PF: {profit_factor:.2f} / Net: {net_profit:,.0f} JPY)")

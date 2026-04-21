@@ -13,10 +13,10 @@ POC 算出や学習用特徴量生成は行いません。
 1. raw parquet を 1取引日単位で読み込む
 2. DAY / NIGHT セッションごとに 30秒足へ集約する
 3. OHLCV、buy_volume、sell_volume、signed_volume、VWAP を算出する
-4. session_type ごとに bar parquet を 1日1ファイルで保存する
+4. bar parquet を 1取引日1ファイル（昼夜連続）で保存する
 
 出力フォーマット:
-  data/bars/nk225_30s/<YEAR>/<YYYY-MM-DD>-<DAY|NIGHT>.parquet
+  data/bars/nk225_30s/<YEAR>/<YYYY-MM-DD>.parquet
 """
 
 import argparse
@@ -200,7 +200,7 @@ def build_30s_bars_from_raw(raw_df: pl.DataFrame, trade_date_str: str) -> pl.Dat
 
 def save_daily_bars(bar_df: pl.DataFrame, output_base_dir: str, trade_date_str: str) -> None:
     """
-    30秒足 DataFrame を session_type ごとに 1日1ファイルで保存します。
+    30秒足 DataFrame を 1取引日1ファイル（昼夜連続）で保存します。
 
     Args:
         bar_df (pl.DataFrame): 30秒足 DataFrame
@@ -208,35 +208,19 @@ def save_daily_bars(bar_df: pl.DataFrame, output_base_dir: str, trade_date_str: 
         trade_date_str (str): JPXのTrade_Date文字列（YYYY-MM-DD）
 
     Notes:
-        JPXのTrade_Dateベースで保存します。
-        これにより、NIGHTセッションが bar_start_jst の暦日で分断されることを防ぎます。
+        JPXのTrade_Dateベースで保存します（NIGHTセッションの日付分断を防止）。
     """
     if bar_df.is_empty():
         return
 
     year_str = trade_date_str[:4]
+    out_dir = os.path.join(output_base_dir, "bars", "nk225_30s", year_str)
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"{trade_date_str}.parquet")
 
-    # session_type 単位で分割し、Trade_Date をそのままファイル名に採用する
-    grouped = bar_df.partition_by("session_type", as_dict=True)
-    for session_type, group in grouped.items():
-        if isinstance(session_type, tuple):
-            session_type = session_type[0]
-
-        out_dir = os.path.join(
-            output_base_dir,
-            "bars",
-            "nk225_30s",
-            year_str,
-        )
-        out_path = os.path.join(out_dir, f"{trade_date_str}-{session_type}.parquet")
-
-        os.makedirs(out_dir, exist_ok=True)
-        # 時系列順にソートして圧縮保存
-        group.sort("bar_start_jst").write_parquet(
-            out_path,
-            compression="zstd",
-        )
-        print(f"Saved: {out_path} ({len(group)} rows)")
+    # DAY/NIGHT を分割せず、Trade_Date 単位でそのまま保存します。
+    bar_df.write_parquet(out_path, compression="zstd")
+    print(f"  -> Saved {out_path} ({len(bar_df)} rows)")
 
 
 def process_one_file(file_path: str, output_base_dir: str) -> None:

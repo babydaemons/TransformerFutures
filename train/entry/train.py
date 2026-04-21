@@ -220,43 +220,24 @@ def main():
     total_required = args.train_days + args.valid_days + args.test_days
     logging.info(f"Found {len(all_feature_files)} feature files. Starting Walk-Forward Validation...")
 
-    # 指定されたセッション（ALLの場合はDAYとNIGHT両方）でループを回す
     target_sessions = ["DAY", "NIGHT"] if args.session == "ALL" else [args.session]
     for current_session in target_sessions:
-        # 指定されたセッションのファイルのみを抽出
-        session_files = [
-            file_path
-            for file_path in all_feature_files
-            if file_path.endswith(f"-{current_session}.parquet")
-        ]
-
-        if len(session_files) < total_required:
-            logging.info(
-                f"Skipping {current_session} session: "
-                f"Not enough files (Found {len(session_files)}, need {total_required})."
-            )
-            continue
-
         logging.info(f"=== Starting Walk-Forward Validation for {current_session} session ===")
 
-        for end_idx in range(total_required, len(session_files) + 1):
-            window_files = session_files[end_idx - total_required: end_idx]
+        for end_idx in range(total_required, len(all_feature_files) + 1):
+            # ウィンドウには昼夜連続の全ファイルが含まれる
+            window_files = all_feature_files[end_idx - total_required: end_idx]
 
-            # 現在のウィンドウの末尾がテスト対象
             test_files = window_files[-args.test_days:]
             if not test_files:
                 continue
 
-            # ファイル名から日付とセッションを再確認（rsplitを使用）
-            test_file_stem = Path(test_files[0]).stem
-            test_target_date, session_type = test_file_stem.rsplit("-", 1)
+            test_target_date = Path(test_files[0]).stem
 
-            # 開始日が指定されている場合、テスト対象日がそれより前ならスキップ
             if args.start and test_target_date < args.start:
                 continue
 
             try:
-                # 同一セッションのファイル群からデータローダーを作成
                 train_loader, valid_loader, test_loader, num_features = create_dataloaders(
                     file_paths=window_files,
                     seq_len=args.seq_len,
@@ -264,6 +245,7 @@ def main():
                     train_days=args.train_days,
                     valid_days=args.valid_days,
                     test_days=args.test_days,
+                    target_session=current_session,
                 )
             except ValueError as e:
                 logging.warning(f"Skipping window ending at {window_files[-1]}: {e}")
@@ -274,10 +256,10 @@ def main():
                 args.out_base_dir,
                 year_str,
                 test_target_date,
-                session_type,
+                current_session,
             )
 
-            logging.info(f"[{session_type}] Current test target: {test_files[0]}")
+            logging.info(f"[{current_session}] Current test target: {test_files[0]}")
             logging.info(f"Model output path: {out_model_path}")
 
             # ==========================================

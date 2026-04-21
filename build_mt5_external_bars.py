@@ -15,7 +15,7 @@ Saver.cs が出力する週次TSV/TSV.gz
   - timestamp 形式: yyyy-MM-dd HH:mm:ss.fff
 
 出力フォーマット:
-  data/bars/external_30s/<SYMBOL>/<YEAR>/<YYYY-MM-DD>-<DAY|NIGHT>.parquet
+  data/bars/external_30s/<SYMBOL>/<YEAR>/<YYYY-MM-DD>.parquet
 """
 
 import argparse
@@ -284,7 +284,7 @@ def save_daily_bars(bar_df: pl.DataFrame, output_base_dir: str, symbol: str) -> 
     30秒足 DataFrame を JPX 基準の取引日・セッションタイプ (DAY/NIGHT) ごとに保存します。
 
     保存先フォーマット:
-      data/bars/external_30s/<SYMBOL>/<YEAR>/<YYYY-MM-DD>-<DAY|NIGHT>.parquet
+      data/bars/external_30s/<SYMBOL>/<YEAR>/<YYYY-MM-DD>.parquet
 
     Args:
         bar_df (pl.DataFrame): 30秒足 DataFrame
@@ -295,8 +295,8 @@ def save_daily_bars(bar_df: pl.DataFrame, output_base_dir: str, symbol: str) -> 
         return
 
     # 推論されたJPX Trade Date単位で保存
-    for keys, group in bar_df.partition_by(["session_date_jst", "session_type"], as_dict=True).items():
-        session_date_jst, session_type = keys if isinstance(keys, tuple) else (keys[0], keys[1])
+    for keys, group in bar_df.partition_by(["session_date_jst"], as_dict=True).items():
+        session_date_jst = keys if not isinstance(keys, tuple) else keys[0]
 
         date_str = session_date_jst.strftime("%Y-%m-%d")
         year_str = date_str[:4]
@@ -304,7 +304,7 @@ def save_daily_bars(bar_df: pl.DataFrame, output_base_dir: str, symbol: str) -> 
         symbol_str = symbol if symbol else "UNKNOWN"
         out_dir = os.path.join(output_base_dir, "bars", "external_30s", symbol_str, year_str)
         os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f"{date_str}-{session_type}.parquet")
+        out_path = os.path.join(out_dir, f"{date_str}.parquet")
 
         group.write_parquet(out_path, compression="zstd")
         print(f"  -> Saved {out_path} ({len(group)} rows)")
