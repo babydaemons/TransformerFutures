@@ -181,13 +181,22 @@ def evaluate_window(
     # スケーラー（平均・標準偏差）をTrainから復元
     means, stds, _ = compute_train_statistics(train_files, label_col="label_efficiency_240")
 
+    # 正しい特徴量次元数を動的に取得するため、学習データ先頭ファイルからダミーの
+    # データセットを構築して num_features を確定します。
+    dummy_ds = SessionSequenceDataset(
+        train_files[0],
+        seq_len=seq_len,
+        feature_means=means,
+        feature_stds=stds,
+    )
+    num_features = dummy_ds.X_data.shape[1]
+
     # 存在するセッションのモデルをロードする。
-    # 現状パッチ指定に従い、入力特徴量数は固定値 101 を使用する。
     loaded_models: Dict[str, TimeSeriesTransformer] = {}
     for session_type, model_path in models_to_run.items():
         try:
             model = TimeSeriesTransformer(
-                num_features=101,
+                num_features=num_features,
                 d_model=128,
                 nhead=8,
                 num_layers=3,
