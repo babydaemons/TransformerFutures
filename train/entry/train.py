@@ -3,15 +3,20 @@
 File: train/entry/train.py
 
 ソースコードの役割:
-本モジュールは、特徴量Parquetを読み込み、Transformerモデルの学習・検証・テストを実行します。
-過学習を防ぐためのEarly Stopping、学習率スケジューラ（ReduceLROnPlateau）、および
-最適なモデル重みの保存（チェックポイント）機能を統合管理する学習パイプラインのエントリーポイントです。
+本モジュールは、特徴量Parquetを読み込み、Transformerモデルの学習・検証・テストを実行する
+学習パイプラインのエントリーポイントです。過学習を防ぐためのEarly Stopping、
+学習率スケジューラ（ReduceLROnPlateau）、および最適なモデル重みの保存
+（チェックポイント）機能を統合管理します。
 
-本戦略は回帰ではなく、優位性の高いトレンドが発生するかどうかの「分類タスク（Classification）」として
-学習を行います。Walk-Forward Validation（ウォークフォワード検証）に対応し、
-時系列のスライディングウィンドウごとにモデルの学習と評価を繰り返し実行します。
-テスト時には、ROC AUCスコアや上位パーセンタイルにおけるトレンド発生確率といった
-実運用における優位性（エッジ）を評価します。
+本戦略は回帰ではなく、優位性の高いトレンドが発生するかどうかの分類タスクとして学習を行います。
+Walk-Forward Validation（ウォークフォワード検証）に対応し、時系列のスライディングウィンドウごとに
+モデルの学習と評価を繰り返し実行します。テスト時には、ROC AUCスコアや上位パーセンタイルにおける
+トレンド発生確率といった実運用における優位性（エッジ）を評価します。
+
+重要:
+1. 学習（Train/Valid）は昼夜通算の連続データ（ALL）で行い、時系列コンテキストの断絶を防ぎます。
+2. 学習後は同一の学習済みモデルを用いて、DAY / NIGHT それぞれのテストデータで独立に評価します。
+3. 評価結果に応じて、DAY / NIGHT ごとのモデルファイル名とJSONファイル名で保存します。
 
 入力想定:
 - data/features/entry/<YEAR>/<YYYY-MM-DD>-<DAY|NIGHT>.parquet
@@ -26,6 +31,7 @@ import glob
 import json
 import logging
 import os
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -127,6 +133,154 @@ def validate_epoch(
     return total_loss / len(dataloader.dataset)
 
 
+def evaluate_and_save_edge(
+    model: nn.Module,
+    test_loader: DataLoader,
+    device: torch.device,
+    out_model_path: str,
+    session_str: str,
+    date_str: str,
+) -> None:
+    """
+    学習済みモデルでテストデータを評価し、エッジ情報をJSONとして保存します。
+
+    Args:
+        model (nn.Module): 評価対象の学習済みモデル。
+        test_loader (DataLoader): テストデータのDataLoader。
+        device (torch.device): 使用デバイス。
+        out_model_path (str): モデル保存パス。
+        session_str (str): セッション名 (DAY/NIGHT)。
+        date_str (str): 対象日 (YYYY-MM-DD)。
+    """
+    model.eval()
+    all_preds: List[float] = []
+    all_trues: List[float] = []
+
+    with torch.no_grad():
+        for batch_x, batch_y in test_loader:
+            batch_x = batch_x.to(device)
+            outputs = model(batch_x)
+
+            # ロジットをSigmoidに通して確率へ変換
+            probs = torch.sigmoid(outputs).cpu().numpy().flatten()
+            all_preds.extend(probs)
+            all_trues.extend(batch_y.cpu().numpy().flatten())
+
+    preds_np = np.array(all_preds)
+    trues_np = np.array(all_trues)
+
+    edge_pct = 0.0
+    if len(preds_np) > 1:
+        if len(np.unique(trues_np)) > 1:
+            auc = roc_auc_score(trues_np, preds_np)
+            logging.info(f"[{session_str}] # ROC AUC Score: {auc:.4f}")
+
+        threshold = np.percentile(preds_np, 80) if len(preds_np) >= 5 else 0.5
+        high_conf_idx = preds_np >= threshold
+
+        baseline_prob = trues_np.mean()
+        top20_prob = trues_np[high_conf_idx].mean() if high_conf_idx.sum() > 0 else 0.0
+        edge_pct = (top20_prob - baseline_prob) * 100
+
+        logging.info(
+            f"[{session_str}] # Baseline: {baseline_prob * 100:.2f}% | "
+            f"Top20%: {top20_prob * 100:.2f}% | Edge: {edge_pct:.2f}%"
+        )
+
+    json_path = os.path.splitext(out_model_path)[0] + ".json"
+    with open(json_path, "w", encoding="utf-8") as file:
+        record = {
+            "date": f"{date_str}T00:00:00+09:00",
+            "session": session_str,
+            "edge": round(float(edge_pct), 2),
+        }
+        # 1行JSONとして保存し、あとで jsonl として連結しやすくする
+        file.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def run_training_window(
+    train_loader: DataLoader,
+    valid_loader: DataLoader,
+    num_features: int,
+    device: torch.device,
+    out_model_path: str,
+    epochs: int = 50,
+    lr: float = 1e-4,
+    early_stop_patience: int = 7,
+) -> nn.Module:
+    """
+    1つのウォークフォワードウィンドウに対して学習を実行します。
+
+    Args:
+        train_loader (DataLoader): 学習用DataLoader。
+        valid_loader (DataLoader): 検証用DataLoader。
+        num_features (int): 入力特徴量数。
+        device (torch.device): 使用デバイス。
+        out_model_path (str): ベストモデル保存先。
+        epochs (int): 最大エポック数。
+        lr (float): 初期学習率。
+        early_stop_patience (int): Early Stopping の待機エポック数。
+
+    Returns:
+        nn.Module: ベスト重みをロードしたモデル。
+    """
+    model = TimeSeriesTransformer(
+        num_features=num_features,
+        d_model=128,
+        nhead=8,
+        num_layers=3,
+        dim_feedforward=256,
+        dropout=0.2,
+    ).to(device)
+
+    # 不均衡データ対策として正例に重みを付与
+    pos_weight = torch.tensor([4.0]).to(device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
+
+    best_valid_loss = float("inf")
+    epochs_no_improve = 0
+
+    for epoch in range(1, epochs + 1):
+        epoch_start = time.time()
+
+        train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
+        valid_loss = validate_epoch(model, valid_loader, criterion, device)
+
+        prev_lr = optimizer.param_groups[0]["lr"]
+        scheduler.step(valid_loss)
+        current_lr = optimizer.param_groups[0]["lr"]
+        epoch_duration = time.time() - epoch_start
+
+        logging.info(
+            f"Epoch {epoch:03d}/{epochs:03d} | "
+            f"Train Loss: {train_loss:.6f} | "
+            f"Valid Loss: {valid_loss:.6f} | "
+            f"LR: {current_lr:.8f} | "
+            f"Time: {epoch_duration:.1f}s"
+        )
+
+        if current_lr != prev_lr:
+            logging.info(f"  -> Learning rate changed: {prev_lr:.8f} -> {current_lr:.8f}")
+
+        if valid_loss < best_valid_loss:
+            best_valid_loss = valid_loss
+            epochs_no_improve = 0
+            torch.save(model.state_dict(), out_model_path)
+            logging.info(f"  -> Best model saved to: {out_model_path}")
+        else:
+            epochs_no_improve += 1
+
+        if epochs_no_improve >= early_stop_patience:
+            logging.info("Early stopping triggered.")
+            break
+
+    model.load_state_dict(torch.load(out_model_path, map_location=device, weights_only=True))
+    return model
+
+
 def build_output_model_path(
     base_dir: str,
     year_str: str,
@@ -182,12 +336,12 @@ def main():
     parser.add_argument("--batch-size", type=int, default=4096, help="バッチサイズ")
     parser.add_argument("--seq-len", type=int, default=60, help="シーケンス長（過去の足の本数）")
     parser.add_argument("--lr", type=float, default=1e-4, help="初期学習率")
-    parser.add_argument("--patience", type=int, default=7, help="Early Stoppingが発動するまでのエポック数")
+    parser.add_argument("--patience", type=int, default=7, help="Early Stopping の待機エポック数")
     parser.add_argument(
         "--out-base-dir",
         type=str,
         default="data",
-        help="モデル出力ベースディレクトリ。実際の保存先は data/entry/<YEAR>/<DATE>-<DAY|NIGHT>.pth",
+        help="モデル出力ベースディレクトリ",
     )
 
     # データ分割の設定（例: 学習60日、検証20日、テスト5日）
@@ -221,24 +375,62 @@ def main():
     logging.info(f"Found {len(all_feature_files)} feature files. Starting Walk-Forward Validation...")
 
     target_sessions = ["DAY", "NIGHT"] if args.session == "ALL" else [args.session]
-    for current_session in target_sessions:
-        logging.info(f"=== Starting Walk-Forward Validation for {current_session} session ===")
 
-        for end_idx in range(total_required, len(all_feature_files) + 1):
-            # ウィンドウには昼夜連続の全ファイルが含まれる
-            window_files = all_feature_files[end_idx - total_required: end_idx]
+    # 窓ごとに1回だけ ALL データで学習し、そのモデルを DAY/NIGHT それぞれで評価する
+    for end_idx in range(total_required, len(all_feature_files) + 1):
+        window_files = all_feature_files[end_idx - total_required: end_idx]
 
-            test_files = window_files[-args.test_days:]
-            if not test_files:
-                continue
+        test_files = window_files[-args.test_days:]
+        if not test_files:
+            continue
 
-            test_target_date = Path(test_files[0]).stem
+        test_target_date = Path(test_files[0]).stem
+        if args.start and test_target_date < args.start:
+            continue
 
-            if args.start and test_target_date < args.start:
-                continue
+        logging.info(f"=== Training Window ending at {test_target_date} (ALL Data) ===")
+
+        try:
+            train_loader, valid_loader, _, num_features = create_dataloaders(
+                file_paths=window_files,
+                seq_len=args.seq_len,
+                batch_size=args.batch_size,
+                train_days=args.train_days,
+                valid_days=args.valid_days,
+                test_days=args.test_days,
+                target_session="ALL",
+            )
+        except ValueError as error:
+            logging.warning(f"Skipping window ending at {window_files[-1]}: {error}")
+            continue
+
+        year_str = Path(test_files[0]).parts[-2]
+        temp_model_path = str(Path(args.out_base_dir) / "entry" / year_str / f"temp_{test_target_date}.pth")
+        Path(temp_model_path).parent.mkdir(parents=True, exist_ok=True)
+
+        model = run_training_window(
+            train_loader=train_loader,
+            valid_loader=valid_loader,
+            num_features=num_features,
+            device=device,
+            out_model_path=temp_model_path,
+            epochs=args.epochs,
+            lr=args.lr,
+            early_stop_patience=args.patience,
+        )
+
+        for current_session in target_sessions:
+            out_model_path = build_output_model_path(
+                args.out_base_dir,
+                year_str,
+                test_target_date,
+                current_session,
+            )
+            shutil.copy2(temp_model_path, out_model_path)
 
             try:
-                train_loader, valid_loader, test_loader, num_features = create_dataloaders(
+                # テストローダーのみ対象セッションで再構築する
+                _, _, test_loader_session, _ = create_dataloaders(
                     file_paths=window_files,
                     seq_len=args.seq_len,
                     batch_size=args.batch_size,
@@ -247,156 +439,21 @@ def main():
                     test_days=args.test_days,
                     target_session=current_session,
                 )
-            except ValueError as e:
-                logging.warning(f"Skipping window ending at {window_files[-1]}: {e}")
+            except ValueError:
+                logging.warning(f"No test data for {current_session} on {test_target_date}")
                 continue
 
-            year_str = Path(test_files[0]).parts[-2]
-            out_model_path = build_output_model_path(
-                args.out_base_dir,
-                year_str,
-                test_target_date,
-                current_session,
+            evaluate_and_save_edge(
+                model=model,
+                test_loader=test_loader_session,
+                device=device,
+                out_model_path=out_model_path,
+                session_str=current_session,
+                date_str=test_target_date,
             )
 
-            logging.info(f"[{current_session}] Current test target: {test_files[0]}")
-            logging.info(f"Model output path: {out_model_path}")
-
-            # ==========================================
-            # 3. モデルの初期化
-            # ==========================================
-            model = TimeSeriesTransformer(
-                num_features=num_features,
-                d_model=128,          # モデルの表現力。大きすぎると過学習しやすくなります
-                nhead=8,              # Multi-Head Attentionの数
-                num_layers=3,         # Encoder層の深さ
-                dim_feedforward=256,
-                dropout=0.2           # 金融データはノイズが多いのでDropoutは強めに設定
-            ).to(device)
-
-            # ==========================================
-            # 4. 損失関数とオプティマイザ
-            # ==========================================
-            # 分類タスク（強いトレンドが発生するかどうか）なので BCEWithLogitsLoss を使用します
-            # 不均衡データ（トレンド発生確率が低い）対策としてポジティブサンプルに重みを付けます
-            pos_weight = torch.tensor([4.0]).to(device)  # 発生確率が約20%なら4.0程度が目安
-            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-            optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-
-            # 検証Lossが改善しなくなった場合に学習率を1/2に下げる
-            scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
-
-            # ==========================================
-            # 5. 学習ループ
-            # ==========================================
-            best_valid_loss = float("inf")
-            epochs_no_improve = 0
-
-            for epoch in range(1, args.epochs + 1):
-                epoch_start = time.time()
-
-                train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
-                valid_loss = validate_epoch(model, valid_loader, criterion, device)
-
-                prev_lr = optimizer.param_groups[0]["lr"]
-                scheduler.step(valid_loss)
-                current_lr = optimizer.param_groups[0]["lr"]
-                epoch_duration = time.time() - epoch_start
-
-                logging.info(
-                    f"Epoch {epoch:03d}/{args.epochs:03d} | "
-                    f"Train Loss: {train_loss:.6f} | Valid Loss: {valid_loss:.6f} | "
-                    f"LR: {current_lr:.8f} | Time: {epoch_duration:.1f}s"
-                )
-
-                if current_lr != prev_lr:
-                    logging.info(f"  -> Learning rate changed: {prev_lr:.8f} -> {current_lr:.8f}")
-
-                # Early Stopping とモデル保存の判定
-                if valid_loss < best_valid_loss:
-                    best_valid_loss = valid_loss
-                    epochs_no_improve = 0
-                    torch.save(model.state_dict(), out_model_path)
-                    logging.info(f"  -> Best model saved to: {out_model_path}")
-                else:
-                    epochs_no_improve += 1
-
-                if epochs_no_improve >= args.patience:
-                    logging.info("Early stopping triggered.")
-                    break
-
-            # ==========================================
-            # 6. テストデータでの最終評価
-            # ==========================================
-            logging.info("Loading best model for Test evaluation...")
-            state_dict = torch.load(
-                out_model_path,
-                map_location=device,
-                weights_only=True,
-            )
-            model.load_state_dict(state_dict)
-
-            # ====== トレード向けのビジネス指標評価 ======
-            model.eval()
-            test_loss = 0.0
-            all_preds = []
-            all_trues = []
-
-            with torch.no_grad():
-                for batch_x, batch_y in test_loader:
-                    batch_x, batch_y = batch_x.to(device), batch_y.to(device)
-                    outputs = model(batch_x)
-
-                    target = batch_y.unsqueeze(-1) if batch_y.dim() == 1 else batch_y
-                    loss = criterion(outputs, target)
-                    test_loss += loss.item() * batch_x.size(0)
-
-                    # ロジットをSigmoidに通して確率(0.0~1.0)に変換して保存
-                    probs = torch.sigmoid(outputs).cpu().numpy().flatten()
-                    all_preds.extend(probs)
-                    all_trues.extend(batch_y.cpu().numpy().flatten())
-
-            test_loss /= len(test_loader.dataset)
-            logging.info(f"Final Test Loss: {test_loss:.6f}")
-
-            preds_np = np.array(all_preds)
-            trues_np = np.array(all_trues)
-
-            # 予測のエッジ（優位性）の定量的評価
-            if len(preds_np) > 1:
-                # ROC AUCの計算 (正例と負例が両方存在する場合のみ)
-                if len(np.unique(trues_np)) > 1:
-                    auc = roc_auc_score(trues_np, preds_np)
-                    logging.info(f"# ROC AUC Score: {auc:.4f}")
-
-                threshold = np.percentile(preds_np, 80)  # 上位20%の予測スコア閾値
-                high_conf_idx = preds_np >= threshold
-
-                baseline_prob = trues_np.mean()
-                top20_prob = trues_np[high_conf_idx].mean() if high_conf_idx.sum() > 0 else 0.0
-                edge_pct = (top20_prob - baseline_prob) * 100
-
-                logging.info(f"# Baseline Trend Prob: {baseline_prob * 100:.2f}%")
-                logging.info(f"# Top 20% Trend Prob:  {top20_prob * 100:.2f}%")
-                logging.info(f"# Edge (Improvement):  {edge_pct:.2f}%")
-
-                # JSONL形式での出力 (cat *.json > history.jsonl でそのまま使える形式)
-                # ファイル名 (2020-02-04-DAY.pth) から日付とセッションを復元
-                stem = Path(out_model_path).stem
-                date_str, session_str = stem.rsplit("-", 1)
-                json_path = os.path.splitext(out_model_path)[0] + ".json"
-
-                with open(json_path, "w", encoding="utf-8") as f:
-                    record = {
-                        "date": f"{date_str}T00:00:00+09:00",
-                        "session": session_str,
-                        "edge": round(float(edge_pct), 2),
-                    }
-                    # 1行のJSONとして書き出し、末尾に改行を付与
-                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-            logging.info("-" * 80)
+        if os.path.exists(temp_model_path):
+            os.remove(temp_model_path)
 
 
 if __name__ == "__main__":
