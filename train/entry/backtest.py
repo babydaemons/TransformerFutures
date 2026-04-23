@@ -165,6 +165,7 @@ def evaluate_window(
     seq_len: int,
     device: torch.device,
     prob_threshold: float,
+    hold_horizon: int,
     sl_ticks: int,
     tp_ticks: int,
 ) -> List[dict]:
@@ -178,6 +179,7 @@ def evaluate_window(
         seq_len: モデル入力のシーケンス長。
         device: 推論に使用するデバイス。
         prob_threshold: エントリーを許可するAIの予測確率の閾値。
+        hold_horizon: 最大ホールド期間（足の本数）。ラベルの horizon と合わせること。
         sl_ticks: 損切りのティック数。
         tp_ticks: 利食いのティック数。
 
@@ -278,7 +280,11 @@ def evaluate_window(
         ).with_columns(
             [
                 # トリガー用に直近5分間（10本）の価格変化（モメンタム）を計算する。
-                (pl.col("raw_close") - pl.col("raw_close").shift(10)).alias("momentum"),
+                # .over() でセッション境界をまたがないよう制限する。
+                (
+                    pl.col("raw_close")
+                    - pl.col("raw_close").shift(10).over(["session_date_jst", "session_type"])
+                ).alias("momentum"),
             ]
         )
 
@@ -286,6 +292,7 @@ def evaluate_window(
         _, trades = simulate_trades(
             df,
             prob_threshold=prob_threshold,
+            hold_horizon=hold_horizon,
             sl_ticks=sl_ticks,
             tp_ticks=tp_ticks,
         )
@@ -319,6 +326,7 @@ def main() -> None:
     parser.add_argument("--prob-threshold", type=float, default=0.6, help="エントリーを許可するAIの確率閾値")
     parser.add_argument("--sl-ticks", type=int, default=10, help="損切り幅(ティック数: 1tick=5円)")
     parser.add_argument("--tp-ticks", type=int, default=20, help="利食い幅(ティック数: 1tick=5円)")
+    parser.add_argument("--hold-horizon", type=int, default=240, help="最大ホールド期間（足の本数）。ラベル horizon=240 に合わせる")
     parser.add_argument("--edge", type=float, default=None, help="指定したエッジ(%)を超える場合のみバックテストを実行する")
     args = parser.parse_args()
 
@@ -385,6 +393,7 @@ def main() -> None:
             args.seq_len,
             device,
             args.prob_threshold,
+            args.hold_horizon,
             args.sl_ticks,
             args.tp_ticks,
         )

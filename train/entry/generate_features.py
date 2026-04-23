@@ -104,8 +104,17 @@ def main() -> None:
     args = parser.parse_args()
 
     nk225_files = sorted(iter_nk225_bar_files(args.bar_base_dir))
-    # USDJPY を含め、要件で定義された外部指標を全て使用します。
-    external_symbols = ["USDJPY", "US500", "NAS100", "XAUUSD", "XTIUSD"]
+    # MT5 シンボル名 → features.py が期待する短縮 prefix のマッピング。
+    # add_cross_asset_features はこの短縮 prefix をハードコードで参照するため、
+    # ここで必ず変換してから external_frames に格納する必要があります。
+    SYMBOL_TO_PREFIX: dict[str, str] = {
+        "USDJPY": "usdjpy",
+        "US500":  "sp500",
+        "NAS100": "nasdaq",
+        "XAUUSD": "xau",
+        "XTIUSD": "xti",
+    }
+    external_symbols = list(SYMBOL_TO_PREFIX.keys())
 
     for filepath in nk225_files:
         date_str = parse_date(filepath)
@@ -128,7 +137,8 @@ def main() -> None:
                 f"{date_str}.parquet",
             )
             if os.path.exists(ext_path):
-                external_frames[sym] = pl.scan_parquet(ext_path)
+                # ディレクトリ名は MT5 シンボル名のまま、キーを短縮 prefix に変換する
+                external_frames[SYMBOL_TO_PREFIX[sym]] = pl.scan_parquet(ext_path)
 
         if len(external_frames) != len(external_symbols):
             print(f"[SKIP] Missing external bars for {date_str}")

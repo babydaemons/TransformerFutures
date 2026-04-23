@@ -459,7 +459,7 @@ def add_cross_asset_features(df: pl.DataFrame) -> pl.DataFrame:
         pl.DataFrame: クロスアセット特徴量が追加されたデータフレーム。
         
     利用想定 prefix:
-        sp500, nasdaq, dow, xau, xti
+        usdjpy, sp500, nasdaq, xau, xti
     """
     # NOTE:
     # LazyFrame.columns は内部でスキーマ解決を走らせるため PerformanceWarning の原因になります。
@@ -541,6 +541,17 @@ def add_cross_asset_features(df: pl.DataFrame) -> pl.DataFrame:
             [
                 (pl.col("xti_ret_1m") - pl.col("sp500_ret_1m")).alias("oil_vs_sp500_divergence_1m"),
                 (pl.col("xti_ret_5m") - pl.col("sp500_ret_5m")).alias("oil_vs_sp500_divergence_5m"),
+            ]
+        )
+
+    # USDJPY: NK225 との相対強弱・リード/ラグ
+    if has("ret_1m", "usdjpy_ret_1m"):
+        exprs.extend(
+            [
+                (pl.col("ret_1m") - pl.col("usdjpy_ret_1m")).alias("rel_strength_vs_usdjpy_1m"),
+                (pl.col("ret_5m") - pl.col("usdjpy_ret_5m")).alias("rel_strength_vs_usdjpy_5m"),
+                (pl.col("ret_1m") - pl.col("usdjpy_ret_1m").shift(1)).alias("lead_lag_vs_usdjpy_1m_lag1"),
+                (pl.col("ret_1m") - pl.col("usdjpy_ret_1m").shift(2)).alias("lead_lag_vs_usdjpy_1m_lag2"),
             ]
         )
 
