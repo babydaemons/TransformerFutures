@@ -135,29 +135,43 @@ def validate_epoch(
 
 def evaluate_and_save_edge(
     model: nn.Module,
-    test_loader: DataLoader,
+    validation_loader: DataLoader,
     device: torch.device,
     out_model_path: str,
     session_str: str,
     date_str: str,
+    train_start: str,
+    train_end: str,
+    valid_start: str,
+    valid_end: str,
+    test_start: str,
+    test_end: str,
+    high_conf_percentile: float = 80.0,
 ) -> None:
     """
-    学習済みモデルでテストデータを評価し、エッジ情報をJSONとして保存します。
+    学習済みモデルを validation データで評価し、エッジ情報をJSONとして保存します。
 
     Args:
         model (nn.Module): 評価対象の学習済みモデル。
-        test_loader (DataLoader): テストデータのDataLoader。
+        validation_loader (DataLoader): 閾値算出に使う validation データのDataLoader。
         device (torch.device): 使用デバイス。
         out_model_path (str): モデル保存パス。
         session_str (str): セッション名 (DAY/NIGHT)。
-        date_str (str): 対象日 (YYYY-MM-DD)。
+        date_str (str): モデル適用対象日 (YYYY-MM-DD)。
+        train_start (str): 学習期間開始日。
+        train_end (str): 学習期間終了日。
+        valid_start (str): validation 期間開始日。
+        valid_end (str): validation 期間終了日。
+        test_start (str): テスト期間開始日。
+        test_end (str): テスト期間終了日。
+        high_conf_percentile (float): 高信頼予測と見なすパーセンタイル。
     """
     model.eval()
     all_preds: List[float] = []
     all_trues: List[float] = []
 
     with torch.no_grad():
-        for batch_x, batch_y in test_loader:
+        for batch_x, batch_y in validation_loader:
             batch_x = batch_x.to(device)
             outputs = model(batch_x)
 
@@ -176,7 +190,7 @@ def evaluate_and_save_edge(
             auc = roc_auc_score(trues_np, preds_np)
             logging.info(f"[{session_str}] # ROC AUC Score: {auc:.4f}")
 
-        threshold = np.percentile(preds_np, 80) if len(preds_np) >= 5 else 0.5
+        threshold = np.percentile(preds_np, high_conf_percentile) if len(preds_np) >= 5 else 0.5
         high_conf_idx = preds_np >= threshold
 
         baseline_prob = trues_np.mean()
@@ -185,7 +199,13 @@ def evaluate_and_save_edge(
 
         logging.info(
             f"[{session_str}] # Baseline: {baseline_prob * 100:.2f}% | "
-            f"Top20%: {top20_prob * 100:.2f}% | Edge: {edge_pct:.2f}%"
+            f"Top{100.0 - high_conf_percentile:.0f}%: {top20_prob * 100:.2f}% | Edge: {edge_pct:.2f}%"
+        )
+        logging.info(
+            f"[{session_str}] Threshold source=validation | "
+            f"Train={train_start}..{train_end} | "
+            f"Valid={valid_start}..{valid_end} | "
+            f"Test={test_start}..{test_end}"
         )
 
     json_path = os.path.splitext(out_model_path)[0] + ".json"
@@ -195,6 +215,15 @@ def evaluate_and_save_edge(
             "session": session_str,
             "edge": round(float(edge_pct), 2),
             "prob_threshold": round(float(threshold), 4),
+            "threshold_source": "validation",
+            "high_conf_percentile": float(high_conf_percentile),
+            "direction_source": "momentum_10bars",
+            "train_start": train_start,
+            "train_end": train_end,
+            "valid_start": valid_start,
+            "valid_end": valid_end,
+            "test_start": test_start,
+            "test_end": test_end,
         }
         # 1行JSONとして保存し、あとで jsonl として連結しやすくする
         file.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -350,6 +379,12 @@ def main():
     parser.add_argument("--train-days", type=int, default=60, help="学習データの日数")
     parser.add_argument("--valid-days", type=int, default=20, help="検証データの日数")
     parser.add_argument("--test-days", type=int, default=5, help="テストデータの日数")
+    parser.add_argument(
+        "--high-conf-percentile",
+        type=float,
+        default=80.0,
+        help="validation 上位何パーセンタイルを高信頼予測として閾値化するか。",
+    )
     parser.add_argument("--start", type=str, default=None, help="処理を開始するテスト対象日 (YYYY-MM-DD)")
     parser.add_argument(
         "--session",
@@ -382,6 +417,8 @@ def main():
         logging.info(f"=== Starting Walk-Forward Validation for {current_session} session ===")
         for end_idx in range(total_required, len(all_feature_files) + 1):
             window_files = all_feature_files[end_idx - total_required: end_idx]
+            train_files = window_files[:args.train_days]
+            valid_files = window_files[args.train_days:args.train_days + args.valid_days]
             test_files = window_files[-args.test_days:]
             if not test_files:
                 continue
@@ -425,6 +462,13 @@ def main():
                 out_model_path,
                 current_session,
                 test_target_date,
+                train_start=Path(train_files[0]).stem,
+                train_end=Path(train_files[-1]).stem,
+                valid_start=Path(valid_files[0]).stem,
+                valid_end=Path(valid_files[-1]).stem,
+                test_start=Path(test_files[0]).stem,
+                test_end=Path(test_files[-1]).stem,
+                high_conf_percentile=args.high_conf_percentile,
             )
 
 

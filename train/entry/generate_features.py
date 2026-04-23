@@ -104,7 +104,8 @@ def main() -> None:
     args = parser.parse_args()
 
     nk225_files = sorted(iter_nk225_bar_files(args.bar_base_dir))
-    external_symbols = ["US500", "NAS100", "XAUUSD", "XTIUSD"]
+    # USDJPY を含め、要件で定義された外部指標を全て使用します。
+    external_symbols = ["USDJPY", "US500", "NAS100", "XAUUSD", "XTIUSD"]
 
     for filepath in nk225_files:
         date_str = parse_date(filepath)

@@ -128,6 +128,7 @@ def simulate_trades(
                         "pnl": trade_pnl,
                         "reason": reason,
                         "prob": entry_prob,
+                        "direction_source": "momentum_10bars_sign",
                     }
                 )
 
@@ -147,6 +148,8 @@ def simulate_trades(
                 entry_time = timestamps[i + 1]
                 entry_prob = prob
 
+                # 現在の方向判定はモデル出力ではなく、直近10本モメンタムの符号を使います。
+                # 方向ソースを JSON にも保存し、モデルのエントリー判定と混同しないようにします。
                 if momentum[i] > 0:
                     position = 1  # Long
                 elif momentum[i] < 0:
@@ -309,7 +312,7 @@ def main() -> None:
     parser.add_argument("--feature-dir", type=str, default="data/features/entry/*/*.parquet")
     parser.add_argument("--model-dir", type=str, default="data/entry")
     parser.add_argument("--seq-len", type=int, default=60)
-    parser.add_argument("--train-days", type=int, default=120)
+    parser.add_argument("--train-days", type=int, default=60)
     parser.add_argument("--valid-days", type=int, default=20)
     parser.add_argument("--test-days", type=int, default=1)
     parser.add_argument("--start", type=str, default=None, help="バックテスト開始日 YYYY-MM-DD")
@@ -329,9 +332,9 @@ def main() -> None:
     logging.info("Starting Backtest...")
 
     for end_idx in range(total_required, len(sorted_files) + 1):
-        window_files = sorted_files[end_idx - total_required : end_idx]
-        test_files = window_files[-args.test_days :]
-        train_files = window_files[: args.train_days]
+        window_files = sorted_files[end_idx - total_required: end_idx]
+        test_files = window_files[-args.test_days:]
+        train_files = window_files[:args.train_days]
 
         test_date = Path(test_files[0]).stem
         if args.start and test_date < args.start:

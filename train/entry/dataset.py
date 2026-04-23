@@ -21,6 +21,16 @@ import torch
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
 
+EXCLUDED_MODEL_FEATURE_COLUMNS = {
+    # バックテスト専用の絶対価格列です。
+    # 価格復元にのみ使い、学習特徴量には投入しません。
+    "raw_open_abs",
+    "raw_high_abs",
+    "raw_low_abs",
+    "raw_close_abs",
+}
+
+
 def compute_train_statistics(
     train_files: List[str],
     label_col: str,
@@ -44,7 +54,7 @@ def compute_train_statistics(
     df_sample = pl.read_parquet(train_files[0])
     feature_cols = [
         name for name, dtype in df_sample.schema.items()
-        if dtype.is_numeric() and name != label_col
+        if dtype.is_numeric() and name != label_col and name not in EXCLUDED_MODEL_FEATURE_COLUMNS
     ]
 
     # 遅延評価（Lazy API）を用いて複数ファイルの統計量を効率的に計算
@@ -103,7 +113,7 @@ class SessionSequenceDataset(Dataset):
         # モデル入力に適さない非数値列（日時、文字列など）やラベル列を除外し、特徴量(X)を特定
         self.feature_cols = [
             name for name, dtype in self.df.schema.items()
-            if dtype.is_numeric() and name != label_col
+            if dtype.is_numeric() and name != label_col and name not in EXCLUDED_MODEL_FEATURE_COLUMNS
         ]
         self.feature_names = self.feature_cols
 
