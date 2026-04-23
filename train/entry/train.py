@@ -170,6 +170,7 @@ def evaluate_and_save_edge(
     trues_np = np.array(all_trues)
 
     edge_pct = 0.0
+    threshold = 0.5
     if len(preds_np) > 1:
         if len(np.unique(trues_np)) > 1:
             auc = roc_auc_score(trues_np, preds_np)
@@ -193,6 +194,7 @@ def evaluate_and_save_edge(
             "date": f"{date_str}T00:00:00+09:00",
             "session": session_str,
             "edge": round(float(edge_pct), 2),
+            "prob_threshold": round(float(threshold), 4),
         }
         # 1行JSONとして保存し、あとで jsonl として連結しやすくする
         file.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -376,132 +378,54 @@ def main():
 
     target_sessions = ["DAY", "NIGHT"] if args.session == "ALL" else [args.session]
 
-    for end_idx in range(total_required, len(all_feature_files) + 1):
-        window_files = all_feature_files[end_idx - total_required: end_idx]
+    for current_session in target_sessions:
+        logging.info(f"=== Starting Walk-Forward Validation for {current_session} session ===")
+        for end_idx in range(total_required, len(all_feature_files) + 1):
+            window_files = all_feature_files[end_idx - total_required: end_idx]
+            test_files = window_files[-args.test_days:]
+            if not test_files:
+                continue
 
-        test_files = window_files[-args.test_days:]
-        if not test_files:
-            continue
+            test_target_date = Path(test_files[0]).stem
+            if args.start and test_target_date < args.start:
+                continue
 
-        test_target_date = Path(test_files[0]).stem
-
-        if args.start and test_target_date < args.start:
-            continue
-
-        logging.info(f"=== Training Window ending at {test_target_date} (ALL Data) ===")
-
-        try:
-            # 1. 昼夜通算 (ALL) で学習用データローダーを作成し、コンテキストの断絶を防ぐ
-            train_loader, valid_loader, _, num_features = create_dataloaders(
-                file_paths=window_files,
-                seq_len=args.seq_len,
-                batch_size=args.batch_size,
-                train_days=args.train_days,
-                valid_days=args.valid_days,
-                test_days=args.test_days,
-                target_session="ALL",
-            )
-        except ValueError as e:
-            logging.warning(f"Skipping window ending at {window_files[-1]}: {e}")
-            continue
-
-        year_str = Path(test_files[0]).parts[-2]
-
-        # DAY/NIGHTでモデルを分けるため、まずはテンポラリ（一時）パスに保存する
-        temp_model_path = str(Path(args.out_base_dir) / "entry" / year_str / f"temp_{test_target_date}.pth")
-        Path(temp_model_path).parent.mkdir(parents=True, exist_ok=True)
-
-        model = TimeSeriesTransformer(
-            num_features=num_features,
-            d_model=128,
-            nhead=8,
-            num_layers=3,
-            dim_feedforward=256,
-            dropout=0.2,
-        )
-        model.to(device)
-
-        criterion = nn.BCEWithLogitsLoss()
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-        scheduler = ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=5, verbose=True
-        )
-
-        # 2. ALLデータで1ウィンドウ分の学習実行
-        best_valid_loss = float("inf")
-        patience_counter = 0
-
-        for epoch in range(1, args.epochs + 1):
-            epoch_start = time.time()
-
-            train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
-            valid_loss = validate_epoch(model, valid_loader, criterion, device)
-
-            prev_lr = optimizer.param_groups[0]["lr"]
-            scheduler.step(valid_loss)
-            current_lr = optimizer.param_groups[0]["lr"]
-            epoch_duration = time.time() - epoch_start
-
-            logging.info(
-                f"Epoch {epoch:03d}/{args.epochs:03d} | "
-                f"Train Loss: {train_loss:.6f} | Valid Loss: {valid_loss:.6f} | "
-                f"LR: {current_lr:.8f} | Time: {epoch_duration:.1f}s"
-            )
-
-            if current_lr != prev_lr:
-                logging.info(f"  -> Learning rate changed: {prev_lr:.8f} -> {current_lr:.8f}")
-
-            if valid_loss < best_valid_loss:
-                best_valid_loss = valid_loss
-                patience_counter = 0
-                torch.save(model.state_dict(), temp_model_path)
-                logging.info("   -> Best model saved")
-            else:
-                patience_counter += 1
-
-            if patience_counter >= args.patience:
-                logging.info("Early stopping triggered.")
-                break
-
-        # 最良のALL学習モデルをロード
-        model.load_state_dict(torch.load(temp_model_path, map_location=device, weights_only=True))
-
-        # 3. エッジ計算の分断を防ぐため、テストデータもALLで一括構築する
-        try:
-            _, _, test_loader_all, _ = create_dataloaders(
-                file_paths=window_files,
-                seq_len=args.seq_len,
-                batch_size=args.batch_size,
-                train_days=args.train_days,
-                valid_days=args.valid_days,
-                test_days=args.test_days,
-                target_session="ALL",
-            )
-
-            # ALLデータで算出した「本来の強いエッジ」をDAY/NIGHT両方に記録する
-            for current_session in target_sessions:
-                out_model_path = build_output_model_path(
-                    args.out_base_dir,
-                    year_str,
-                    test_target_date,
-                    current_session,
+            try:
+                # Z-Scoreの破壊を防ぐため、セッションごとに独立して学習・検証する
+                train_loader, valid_loader, test_loader, num_features = create_dataloaders(
+                    file_paths=window_files,
+                    seq_len=args.seq_len,
+                    batch_size=args.batch_size,
+                    train_days=args.train_days,
+                    valid_days=args.valid_days,
+                    test_days=args.test_days,
+                    target_session=current_session,
                 )
-                shutil.copy2(temp_model_path, out_model_path)
+            except ValueError:
+                continue
 
-                evaluate_and_save_edge(
-                    model,
-                    test_loader_all,
-                    device,
-                    out_model_path,
-                    current_session,
-                    test_target_date,
-                )
-        except ValueError:
-            logging.warning(f"No test data for ALL on {test_target_date}")
+            year_str = Path(test_files[0]).parts[-2]
+            out_model_path = build_output_model_path(args.out_base_dir, year_str, test_target_date, current_session)
 
-        # 一時ファイルを削除
-        if os.path.exists(temp_model_path):
-            os.remove(temp_model_path)
+            model = run_training_window(
+                train_loader,
+                valid_loader,
+                num_features,
+                device,
+                out_model_path,
+                epochs=args.epochs,
+                lr=args.lr,
+            )
+
+            # 【超重要】未来のカンニングを防ぐため、エッジと閾値は直近20日間(Valid)で評価する
+            evaluate_and_save_edge(
+                model,
+                valid_loader,
+                device,
+                out_model_path,
+                current_session,
+                test_target_date,
+            )
 
 
 if __name__ == "__main__":

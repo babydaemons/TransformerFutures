@@ -71,6 +71,7 @@ def simulate_trades(
     closes = df["raw_close"].to_list()
     opens = df["raw_open"].to_list()
     probs = df["prob"].to_list()
+    thresholds = df["threshold"].to_list()
     momentum = df["momentum"].to_list()
     highs = df["raw_high"].to_list()
     lows = df["raw_low"].to_list()
@@ -137,8 +138,10 @@ def simulate_trades(
         # --- 2. エントリー判定 ---
         if position == 0 and cooldown_bars == 0 and i < n - 1:
             prob = probs[i]
-            # 確率が閾値を超えており、かつモメンタムが計算できている場合
-            if prob is not None and prob >= prob_threshold and momentum[i] is not None:
+            # JSONから取得した動的閾値がある場合はそれを使用、なければ固定値
+            thr = thresholds[i] if thresholds[i] > 0.0 else prob_threshold
+
+            if prob is not None and prob >= thr and momentum[i] is not None:
                 # 次の足の始値で成行エントリー
                 entry_price = opens[i + 1]
                 entry_time = timestamps[i + 1]
@@ -155,7 +158,7 @@ def simulate_trades(
 def evaluate_window(
     train_files: List[str],
     test_files: List[str],
-    models_to_run: Dict[str, str],
+    models_to_run: Dict[str, dict],
     seq_len: int,
     device: torch.device,
     prob_threshold: float,
@@ -168,7 +171,7 @@ def evaluate_window(
     Args:
         train_files: スケーラー復元用の学習データファイルパスのリスト。
         test_files: 評価対象となるテストデータファイルパスのリスト。
-        models_to_run: セッション種別をキー、モデルパスを値とする辞書。
+        models_to_run: セッション種別をキー、モデル情報を値とする辞書。
         seq_len: モデル入力のシーケンス長。
         device: 推論に使用するデバイス。
         prob_threshold: エントリーを許可するAIの予測確率の閾値。
@@ -192,8 +195,8 @@ def evaluate_window(
     num_features = dummy_ds.X_data.shape[1]
 
     # 存在するセッションのモデルをロードする。
-    loaded_models: Dict[str, TimeSeriesTransformer] = {}
-    for session_type, model_path in models_to_run.items():
+    loaded_models: Dict[str, dict] = {}
+    for session_type, meta in models_to_run.items():
         try:
             model = TimeSeriesTransformer(
                 num_features=num_features,
@@ -203,10 +206,10 @@ def evaluate_window(
                 dim_feedforward=256,
                 dropout=0.2,
             )
-            model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+            model.load_state_dict(torch.load(meta["path"], map_location=device, weights_only=True))
             model.to(device)
             model.eval()
-            loaded_models[session_type] = model
+            loaded_models[session_type] = {"model": model, "threshold": meta["threshold"]}
         except Exception as e:
             logging.error(f"Failed to load {session_type} model: {e}")
 
@@ -234,6 +237,7 @@ def evaluate_window(
         # 各有効インデックス位置へセッション別モデルの予測値を直接書き戻す。
         # 推論不能な先頭部や対象外セッションの位置は 0.0 のまま残る。
         full_preds = np.zeros(len(df), dtype=np.float32)
+        full_thresholds = np.zeros(len(df), dtype=np.float32)
         session_types = df["session_type"].to_list()
 
         with torch.no_grad():
@@ -244,19 +248,23 @@ def evaluate_window(
                 end_i = start_i + len(batch_x)
                 batch_indices = dataset.valid_indices[start_i:end_i]
 
-                for session_type, model in loaded_models.items():
-                    mask = [session_types[idx] == session_type for idx in batch_indices]
+                for s_type, m_data in loaded_models.items():
+                    model = m_data["model"]
+                    thr = m_data["threshold"]
+                    mask = [session_types[idx] == s_type for idx in batch_indices]
                     if not any(mask):
                         continue
 
                     probs = torch.sigmoid(model(batch_x)).cpu().numpy().flatten()
                     for i, idx in enumerate(batch_indices):
-                        if session_types[idx] == session_type:
+                        if session_types[idx] == s_type:
                             full_preds[idx] = probs[i]
+                            full_thresholds[idx] = thr
 
         df = df.with_columns(
             [
                 pl.Series("prob", full_preds, dtype=pl.Float32),
+                pl.Series("threshold", full_thresholds, dtype=pl.Float32),
                 # 事前に保存しておいた絶対価格を復元用に使用する。
                 # 累積和ベースの復元で起こり得るオフバイワンやGAP起因の累積誤差を避ける。
                 pl.col("raw_open_abs").alias("raw_open"),
@@ -332,7 +340,7 @@ def main() -> None:
         year_str = os.path.basename(os.path.dirname(test_files[0]))
 
         # 1取引日内の DAY / NIGHT セッションに対応するモデルを収集する。
-        models_to_run: Dict[str, str] = {}
+        models_to_run: Dict[str, dict] = {}
         for session_type in ["DAY", "NIGHT"]:
             model_path = os.path.join(args.model_dir, year_str, f"{test_date}-{session_type}.pth")
             json_path = os.path.join(args.model_dir, year_str, f"{test_date}-{session_type}.json")
@@ -340,6 +348,7 @@ def main() -> None:
             if not os.path.exists(model_path):
                 continue
 
+            prob_thr = args.prob_threshold
             # --- エッジによるフィルタリング ---
             if args.edge is not None:
                 if not os.path.exists(json_path):
@@ -347,7 +356,9 @@ def main() -> None:
 
                 try:
                     with open(json_path, "r", encoding="utf-8") as f:
-                        edge_val = json.loads(f.read().strip()).get("edge", 0.0)
+                        record = json.loads(f.read().strip())
+                        edge_val = record.get("edge", 0.0)
+                        prob_thr = record.get("prob_threshold", args.prob_threshold)
 
                     if edge_val <= args.edge:
                         logging.info(
@@ -358,7 +369,7 @@ def main() -> None:
                 except Exception:
                     continue
 
-            models_to_run[session_type] = model_path
+            models_to_run[session_type] = {"path": model_path, "threshold": prob_thr}
 
         if not models_to_run:
             continue
