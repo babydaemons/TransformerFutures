@@ -64,38 +64,46 @@ def _safe_log1p(col: str) -> pl.Expr:
     return pl.when(pl.col(col) > -1.0).then((pl.col(col) + 1.0).log()).otherwise(None)
 
 
-def _log_ret(col: str, periods: int = 1) -> pl.Expr:
+def _log_ret(col: str, periods: int = 1, over: list[str] | None = None) -> pl.Expr:
     """
-    対数リターンを返します。
+    対数リターンを返します。over を指定するとセッション内で計算します。
     
     Args:
         col (str): 対象の列名。
         periods (int, optional): 差分をとる期間（ラグ）。デフォルトは 1。
+        over (list[str] | None): セッション境界を考慮する場合の group キー。
         
     Returns:
         pl.Expr: 対数リターンの式。
     """
+    shift_expr = pl.col(col).shift(periods)
+    if over:
+        shift_expr = shift_expr.over(over)
     return (
-        (pl.col(col).log() - pl.col(col).shift(periods).log())
+        (pl.col(col).log() - shift_expr.log())
         .alias(f"{col}_log_ret_{periods}")
     )
 
 
-def _pct_ret(col: str, periods: int = 1) -> pl.Expr:
+def _pct_ret(col: str, periods: int = 1, over: list[str] | None = None) -> pl.Expr:
     """
-    単純リターン (変化率) を返します。
+    単純リターン (変化率) を返します。over を指定するとセッション内で計算します。
     
     Args:
         col (str): 対象の列名。
         periods (int, optional): 差分をとる期間（ラグ）。デフォルトは 1。
+        over (list[str] | None): セッション境界を考慮する場合の group キー。
         
     Returns:
         pl.Expr: 単純リターンの式。
     """
+    shift_expr = pl.col(col).shift(periods)
+    if over:
+        shift_expr = shift_expr.over(over)
     return (
         _safe_ratio(
-            pl.col(col) - pl.col(col).shift(periods),
-            pl.col(col).shift(periods),
+            pl.col(col) - shift_expr,
+            shift_expr,
         ).alias(f"{col}_ret_{periods}")
     )
 
@@ -130,21 +138,25 @@ def _rolling_zscore(col: str, window: int, min_periods: int | None = None) -> li
     ]
 
 
-def _linear_slope(col: str, window: int) -> pl.Expr:
+def _linear_slope(col: str, window: int, over: list[str] | None = None) -> pl.Expr:
     """
     簡易傾き特徴量を計算します。
     厳密な最小二乗ではなく、window 本前との差分を window で割った近似傾きです。
-    まずは軽量・堅牢性を優先します。
+    over を指定するとセッション内で計算します。
     
     Args:
         col (str): 対象の列名。
         window (int): 比較する過去の期間。
+        over (list[str] | None): セッション境界を考慮する場合の group キー。
         
     Returns:
         pl.Expr: 簡易傾きの式。
     """
+    shift_expr = pl.col(col).shift(window)
+    if over:
+        shift_expr = shift_expr.over(over)
     return (
-        (pl.col(col) - pl.col(col).shift(window)) / float(window)
+        (pl.col(col) - shift_expr) / float(window)
     ).alias(f"{col}_slope_{window}")
 
 
@@ -281,26 +293,26 @@ def add_nk225_base_features(df: pl.DataFrame) -> pl.DataFrame:
 
     df = df.with_columns(
         [
-            _log_ret("close", 1).alias("log_ret"),
-            _pct_ret("close", BAR_1M).alias("ret_1m"),
-            _pct_ret("close", BAR_2M).alias("ret_2m"),
-            _pct_ret("close", BAR_5M).alias("ret_5m"),
-            _pct_ret("close", BAR_10M).alias("ret_10m"),
-            _pct_ret("close", BAR_30M).alias("ret_30m"),
-            _pct_ret("close", BAR_60M).alias("ret_60m"),
-            _linear_slope("close", BAR_5M).alias("close_slope_5m"),
-            _linear_slope("close", BAR_10M).alias("close_slope_10m"),
-            _linear_slope("signed_volume", BAR_5M).alias("signed_volume_slope_5m"),
-            _linear_slope("tick_count", BAR_5M).alias("tick_count_slope_5m"),
+            _log_ret("close", 1, over=_session_group_keys()).alias("log_ret"),
+            _pct_ret("close", BAR_1M, over=_session_group_keys()).alias("ret_1m"),
+            _pct_ret("close", BAR_2M, over=_session_group_keys()).alias("ret_2m"),
+            _pct_ret("close", BAR_5M, over=_session_group_keys()).alias("ret_5m"),
+            _pct_ret("close", BAR_10M, over=_session_group_keys()).alias("ret_10m"),
+            _pct_ret("close", BAR_30M, over=_session_group_keys()).alias("ret_30m"),
+            _pct_ret("close", BAR_60M, over=_session_group_keys()).alias("ret_60m"),
+            _linear_slope("close", BAR_5M, over=_session_group_keys()).alias("close_slope_5m"),
+            _linear_slope("close", BAR_10M, over=_session_group_keys()).alias("close_slope_10m"),
+            _linear_slope("signed_volume", BAR_5M, over=_session_group_keys()).alias("signed_volume_slope_5m"),
+            _linear_slope("tick_count", BAR_5M, over=_session_group_keys()).alias("tick_count_slope_5m"),
         ]
     )
 
     df = df.with_columns(
         [
             # 実現ボラの軽量版
-            pl.col("log_ret").rolling_std(window_size=BAR_5M, min_periods=5).alias("realized_vol_5m"),
-            pl.col("log_ret").rolling_std(window_size=BAR_10M, min_periods=10).alias("realized_vol_10m"),
-            pl.col("log_ret").rolling_std(window_size=BAR_30M, min_periods=20).alias("realized_vol_30m"),
+            pl.col("log_ret").rolling_std(window_size=BAR_5M, min_periods=5).over(_session_group_keys()).alias("realized_vol_5m"),
+            pl.col("log_ret").rolling_std(window_size=BAR_10M, min_periods=10).over(_session_group_keys()).alias("realized_vol_10m"),
+            pl.col("log_ret").rolling_std(window_size=BAR_30M, min_periods=20).over(_session_group_keys()).alias("realized_vol_30m"),
 
             # Garman-Klass 近似
             (
@@ -309,18 +321,18 @@ def add_nk225_base_features(df: pl.DataFrame) -> pl.DataFrame:
             ).clip(lower_bound=0.0).sqrt().alias("garman_klass_vol"),
 
             # 累積差分系
-            pl.col("signed_volume").rolling_sum(window_size=BAR_2M, min_periods=2).alias("signed_volume_sum_2m"),
-            pl.col("signed_volume").rolling_sum(window_size=BAR_5M, min_periods=5).alias("signed_volume_sum_5m"),
-            pl.col("signed_volume").rolling_sum(window_size=BAR_10M, min_periods=10).alias("signed_volume_sum_10m"),
-            pl.col("volume").rolling_sum(window_size=BAR_5M, min_periods=5).alias("volume_sum_5m"),
-            pl.col("tick_count").rolling_mean(window_size=BAR_5M, min_periods=5).alias("tick_count_ma_5m"),
+            pl.col("signed_volume").rolling_sum(window_size=BAR_2M, min_periods=2).over(_session_group_keys()).alias("signed_volume_sum_2m"),
+            pl.col("signed_volume").rolling_sum(window_size=BAR_5M, min_periods=5).over(_session_group_keys()).alias("signed_volume_sum_5m"),
+            pl.col("signed_volume").rolling_sum(window_size=BAR_10M, min_periods=10).over(_session_group_keys()).alias("signed_volume_sum_10m"),
+            pl.col("volume").rolling_sum(window_size=BAR_5M, min_periods=5).over(_session_group_keys()).alias("volume_sum_5m"),
+            pl.col("tick_count").rolling_mean(window_size=BAR_5M, min_periods=5).over(_session_group_keys()).alias("tick_count_ma_5m"),
 
             # VWAP 乖離の多窓
             (
                 pl.col("close")
                 - (
-                    (pl.col("typical_price") * pl.col("volume")).rolling_sum(window_size=BAR_15M, min_periods=10)
-                    / pl.col("volume").rolling_sum(window_size=BAR_15M, min_periods=10)
+                    (pl.col("typical_price") * pl.col("volume")).rolling_sum(window_size=BAR_15M, min_periods=10).over(_session_group_keys())
+                    / pl.col("volume").rolling_sum(window_size=BAR_15M, min_periods=10).over(_session_group_keys())
                 )
             ).alias("dist_vwap_15m"),
         ]
@@ -329,9 +341,9 @@ def add_nk225_base_features(df: pl.DataFrame) -> pl.DataFrame:
     df = df.with_columns(
         [
             _safe_ratio(pl.col("tick_count"), pl.col("tick_count_ma_5m")).alias("tick_speed_ratio"),
-            (pl.col("signed_volume_ratio") - pl.col("signed_volume_ratio").shift(1)).alias("signed_volume_ratio_change"),
-            (pl.col("buy_ratio") - pl.col("buy_ratio").shift(1)).alias("buy_share_change"),
-            (pl.col("sell_ratio") - pl.col("sell_ratio").shift(1)).alias("sell_share_change"),
+            (pl.col("signed_volume_ratio") - pl.col("signed_volume_ratio").shift(1).over(_session_group_keys())).alias("signed_volume_ratio_change"),
+            (pl.col("buy_ratio") - pl.col("buy_ratio").shift(1).over(_session_group_keys())).alias("buy_share_change"),
+            (pl.col("sell_ratio") - pl.col("sell_ratio").shift(1).over(_session_group_keys())).alias("sell_share_change"),
             _safe_ratio(pl.col("price_spread"), pl.col("volume") + 1.0).alias("range_per_volume"),
             _safe_ratio(pl.col("tick_count"), pl.col("volume") + 1.0).alias("tick_per_volume"),
         ]
@@ -409,21 +421,21 @@ def add_external_symbol_features(df: pl.DataFrame, prefix: str) -> pl.DataFrame:
                 pl.col(high_col) - pl.col(low_col),
                 default=0.0,
             ).alias(f"{prefix}_body_ratio"),
-            (pl.col(close_col).log() - pl.col(close_col).shift(1).log()).alias(f"{prefix}_log_ret"),
-            _safe_ratio(pl.col(close_col) - pl.col(close_col).shift(BAR_1M), pl.col(close_col).shift(BAR_1M)).alias(f"{prefix}_ret_1m"),
-            _safe_ratio(pl.col(close_col) - pl.col(close_col).shift(BAR_5M), pl.col(close_col).shift(BAR_5M)).alias(f"{prefix}_ret_5m"),
-            _safe_ratio(pl.col(close_col) - pl.col(close_col).shift(BAR_10M), pl.col(close_col).shift(BAR_10M)).alias(f"{prefix}_ret_10m"),
-            _linear_slope(close_col, BAR_5M).alias(f"{prefix}_close_slope_5m"),
-            _linear_slope(close_col, BAR_10M).alias(f"{prefix}_close_slope_10m"),
-            _linear_slope(tick_col, BAR_5M).alias(f"{prefix}_tick_count_slope_5m"),
+            (pl.col(close_col).log() - pl.col(close_col).shift(1).over(_session_group_keys()).log()).alias(f"{prefix}_log_ret"),
+            _safe_ratio(pl.col(close_col) - pl.col(close_col).shift(BAR_1M).over(_session_group_keys()), pl.col(close_col).shift(BAR_1M).over(_session_group_keys())).alias(f"{prefix}_ret_1m"),
+            _safe_ratio(pl.col(close_col) - pl.col(close_col).shift(BAR_5M).over(_session_group_keys()), pl.col(close_col).shift(BAR_5M).over(_session_group_keys())).alias(f"{prefix}_ret_5m"),
+            _safe_ratio(pl.col(close_col) - pl.col(close_col).shift(BAR_10M).over(_session_group_keys()), pl.col(close_col).shift(BAR_10M).over(_session_group_keys())).alias(f"{prefix}_ret_10m"),
+            _linear_slope(close_col, BAR_5M, over=_session_group_keys()).alias(f"{prefix}_close_slope_5m"),
+            _linear_slope(close_col, BAR_10M, over=_session_group_keys()).alias(f"{prefix}_close_slope_10m"),
+            _linear_slope(tick_col, BAR_5M, over=_session_group_keys()).alias(f"{prefix}_tick_count_slope_5m"),
         ]
     )
 
     df = df.with_columns(
         [
-            pl.col(f"{prefix}_log_ret").rolling_std(window_size=BAR_5M, min_periods=5).alias(f"{prefix}_realized_vol_5m"),
-            pl.col(f"{prefix}_log_ret").rolling_std(window_size=BAR_10M, min_periods=10).alias(f"{prefix}_realized_vol_10m"),
-            pl.col(tick_col).rolling_mean(window_size=BAR_5M, min_periods=5).alias(f"{prefix}_tick_count_ma_5m"),
+            pl.col(f"{prefix}_log_ret").rolling_std(window_size=BAR_5M, min_periods=5).over(_session_group_keys()).alias(f"{prefix}_realized_vol_5m"),
+            pl.col(f"{prefix}_log_ret").rolling_std(window_size=BAR_10M, min_periods=10).over(_session_group_keys()).alias(f"{prefix}_realized_vol_10m"),
+            pl.col(tick_col).rolling_mean(window_size=BAR_5M, min_periods=5).over(_session_group_keys()).alias(f"{prefix}_tick_count_ma_5m"),
         ]
     )
 
@@ -742,12 +754,16 @@ def make_prices_stationary(df: pl.DataFrame, external_prefixes: list[str] | None
     # 実際にDataFrameに存在する列のみを対象とする
     target_cols = [col for col in price_cols if col in available_cols]
     
-    # 1行前からの差分に置き換える（絶対値のスケール依存を排除）
+    # 1行前からの差分に置き換える（絶対値のスケール依存を排除）。
+    # .over() でセッション境界（DAY/NIGHT の切り替わり）をまたがないよう制限します。
+    # これにより、各セッション先頭バーは「前セッション末尾との差分」ではなく
+    # null になり、後段の drop_nulls で正しく除外されます。
+    session_keys = _session_group_keys()
     df = df.with_columns(
-        [(pl.col(col) - pl.col(col).shift(1)).alias(col) for col in target_cols]
+        [(pl.col(col) - pl.col(col).shift(1).over(session_keys)).alias(col) for col in target_cols]
     )
     
-    # shift(1) により先頭行が必ず null になるためドロップ
+    # .over() による shift(1) で各セッション先頭行が null になるためドロップ
     return df.drop_nulls(subset=target_cols)
 
 
@@ -776,7 +792,12 @@ def build_entry_feature_frame(
             "xti": xti_df,
         }
     """
-    df = nk225_df.sort(["session_date_jst", "session_type", "bar_start_jst"])
+    # session_type をソートキーから除くことで真の時系列順にする。
+    # ["session_date_jst", "session_type", "bar_start_jst"] では "DAY" < "NIGHT" の
+    # アルファベット順により、同一 trade_date 内に2つの NIGHT 期間がある場合
+    # (例: 月曜日の前夜 NIGHT が DAY より後ろに配置される) にタイムスタンプが
+    # 逆転することがある。bar_start_jst のみでソートすると常に時系列順になる。
+    df = nk225_df.sort(["session_date_jst", "bar_start_jst"])
 
     if external_frames:
         df = join_external_frames(df, external_frames)

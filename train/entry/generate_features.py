@@ -14,7 +14,7 @@ PolarsのLazyFrameを活用し、数年分のデータでも省メモリで
 2. 外部指標 30秒 bar parquet をシンボル別に列挙・読み込みする（LazyFrame）
 3. 同一取引日の bar を結合対象として揃える
 4. 特徴量およびラベルを生成するための実行計画を構築する
-5. 学習用 parquet を sink_parquet を用いてストリーミング保存する
+5. 学習用 parquet を collect() → write_parquet() でソート順を保証して保存する
 
 入力想定:
 - NK225:
@@ -158,7 +158,9 @@ def main() -> None:
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, f"{date_str}.parquet")
 
-        feature_df.sink_parquet(out_path, compression="zstd")
+        # sink_parquet はストリーミング実行のためグローバルなソート順が保証されない。
+        # collect() で eager に変換してからファイルへ書き込む。
+        feature_df.collect().write_parquet(out_path, compression="zstd")
         print(f"[SAVE] {out_path}")
 
 

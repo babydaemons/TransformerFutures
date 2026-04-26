@@ -126,10 +126,10 @@ def build_30s_bars_from_raw(raw_df: pl.DataFrame, trade_date_str: str) -> pl.Dat
         )
         .agg(
             [
-                pl.col("price").first().alias("open"),
+                pl.col("price").sort_by(pl.col("trade_ts")).first().alias("open"),
                 pl.col("price").max().alias("high"),
                 pl.col("price").min().alias("low"),
-                pl.col("price").last().alias("close"),
+                pl.col("price").sort_by(pl.col("trade_ts")).last().alias("close"),
                 pl.col("trade_volume").sum().cast(pl.Float64).alias("volume"),
                 pl.len().cast(pl.Int32).alias("tick_count"),
                 pl.col("buy_vol").sum().cast(pl.Float64).alias("buy_volume"),

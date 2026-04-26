@@ -1,5 +1,12 @@
 {
     "cSpell.words": [
-        "venv"
+        "BACKTEST",
+        "drawdowns",
+        "figsize",
+        "linestyle",
+        "lookback",
+        "venv",
+        "xlabel",
+        "ylabel"
     ]
 }
