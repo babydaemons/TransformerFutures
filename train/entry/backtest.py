@@ -47,6 +47,10 @@ def simulate_trades(
     max_momentum_abs: float = 0.0,
     max_daily_trades: int = 0,
     max_prob: float = 1.0,
+    be_ticks: int = 0,
+    be_min_bars: int = 0,
+    weak_exit_bars: int = 0,
+    weak_exit_ticks: float = 0.0,
 ) -> Tuple[float, List[dict]]:
     """
     1日分のデータフレームでトレードをシミュレーションします。
@@ -64,6 +68,21 @@ def simulate_trades(
             0 の場合は無制限。過剰エントリー抑制に使用します。
         max_prob: エントリーを許可するAIの確率上限閾値（デフォルト 1.0 = 上限なし）。
             高確率ゾーンでの逆張り的過適合を防ぎます。
+        be_ticks: ブレークイーブンストップのトリガー幅（ティック数）。
+            ポジションが be_ticks × 5円 以上のバー高値（LONG）または安値（SHORT）を
+            記録した後に損切りラインをエントリー価格へ移動する。
+            MFE 更新と BE 発動は SL/TP チェックの後に行われるため、
+            発動バーと同一バーで即 BE 決済されることはない（翌バーから有効）。
+            0 の場合は無効（従来どおり固定SL）。
+        be_min_bars: BE 発動を許可する最低保有本数（デフォルト 0 = 制限なし）。
+            エントリー直後の短期ノイズで BE が過剰発動するのを抑制する。
+            例: 20 なら 10分間は BE を無効にする。
+        weak_exit_bars: ウィーク決済の評価タイミング（本数）。0 の場合は無効。
+            bars_held == weak_exit_bars の時点で MFE < weak_exit_ticks×5円 なら
+            現在のクローズ価格で即決済する。初動で方向確認が取れないトレードを
+            フルSLになる前に早期撤退させる。例: 60 (30分後に判定)。
+        weak_exit_ticks: ウィーク決済をトリガーする MFE 上限（ティック数）。
+            0.0 の場合は weak_exit_bars と合わせて無効。
 
     Returns:
         セッションの合計損益(円)と、トレード履歴のリスト。
@@ -77,6 +96,8 @@ def simulate_trades(
     bars_held = 0
     cooldown_bars = 0  # 決済後の待機時間（足の本数）
     entry_session_key: Optional[str] = None  # セッション境界検出用
+    be_triggered = False   # ブレークイーブンストップが発動済みか
+    mfe = 0.0              # Maximum Favorable Excursion (含み益の最大値、円)
 
     session_pnl = 0.0
     trades: List[dict] = []
@@ -111,16 +132,49 @@ def simulate_trades(
             hit_tp = False
             exit_price = 0.0
 
+            # 有効な損切りライン: BE は「前バーまでの状態」で判定する。
+            # MFE 更新と BE 発動は SL/TP チェックの後に行う（↓）ことで、
+            # 「発動バーと同バーで即 BE 決済」というバグを防ぐ。
+            effective_sl_long  = entry_price if be_triggered else entry_price - (sl_ticks * 5.0)
+            effective_sl_short = entry_price if be_triggered else entry_price + (sl_ticks * 5.0)
+
             if position == 1:  # Long
-                if lows[i] <= entry_price - (sl_ticks * 5.0):
-                    hit_sl, exit_price = True, entry_price - (sl_ticks * 5.0)
+                if lows[i] <= effective_sl_long:
+                    hit_sl, exit_price = True, effective_sl_long
                 elif highs[i] >= entry_price + (tp_ticks * 5.0):
                     hit_tp, exit_price = True, entry_price + (tp_ticks * 5.0)
             elif position == -1:  # Short
-                if highs[i] >= entry_price + (sl_ticks * 5.0):
-                    hit_sl, exit_price = True, entry_price + (sl_ticks * 5.0)
+                if highs[i] >= effective_sl_short:
+                    hit_sl, exit_price = True, effective_sl_short
                 elif lows[i] <= entry_price - (tp_ticks * 5.0):
                     hit_tp, exit_price = True, entry_price - (tp_ticks * 5.0)
+
+            # --- ブレークイーブンストップ & ウィーク決済: MFE 更新とトリガー判定 ---
+            # SL/TP チェックの後に実行。BE 発動は翌バーの SL チェックから有効になる。
+            if not hit_sl and not hit_tp:
+                if position == 1:
+                    mfe = max(mfe, highs[i] - entry_price)
+                elif position == -1:
+                    mfe = max(mfe, entry_price - lows[i])
+
+                # BE トリガー
+                be_eligible = (be_ticks > 0
+                               and not be_triggered
+                               and bars_held >= max(be_min_bars, 1)
+                               and mfe >= be_ticks * 5.0)
+                if be_eligible:
+                    be_triggered = True
+
+                # ウィーク決済: 指定本数後も MFE が閾値未満なら軟決済。
+                # 初動で方向が取れていないトレードをフル SL になる前に撤退させる。
+                # NOTE: hit_sl フラグは使わず専用フラグで管理することで
+                #       reason が "SL" に上書きされるバグを防ぐ。
+                weak_exit_triggered = (
+                    weak_exit_bars > 0
+                    and weak_exit_ticks > 0.0
+                    and bars_held == weak_exit_bars
+                    and mfe < weak_exit_ticks * 5.0
+                )
 
             # セッション境界チェック: DAY→NIGHT またはファイル間をまたいだ場合に強制決済する。
             # 1日ファイルは [DAY 08:45-15:15] → [NIGHT 16:30-翌05:55] の順で格納されているが、
@@ -133,12 +187,22 @@ def simulate_trades(
             )
             time_exit = bars_held >= hold_horizon or i == n - 1 or session_changed
 
-            if hit_sl or hit_tp or time_exit:
-                if not (hit_sl or hit_tp):
-                    # 時間切れまたはセッション境界到達の場合は次の足の始値（または現在の終値）で決済
+            if hit_sl or hit_tp or time_exit or weak_exit_triggered:
+                if weak_exit_triggered and not hit_sl and not hit_tp:
+                    # WEAK決済: 現在のクローズ価格で成行。SL/TP より優先して処理する。
+                    exit_price = closes[i]
+                    exit_time_rec = timestamps[i]
+                    reason = "WEAK"
+                elif not (hit_sl or hit_tp):
+                    # 時間切れまたはセッション境界到達の場合は次の足の始値（または現在の終値）で決済。
+                    # exit_time も実際の約定バー（i+1）のタイムスタンプを使うことで
+                    # entry_time との時刻逆転を防ぐ。
                     exit_price = opens[i + 1] if i < n - 1 else closes[i]
+                    exit_time_rec = timestamps[i + 1] if i < n - 1 else timestamps[i]
                     reason = "SESSION" if session_changed else "TIME"
                 else:
+                    # SL / TP はバー内約定（intrabar）。exit_time はバー開始時刻を使う。
+                    exit_time_rec = timestamps[i]
                     reason = "TP" if hit_tp else "SL"
 
                 # 損益計算（価格差 × 建玉方向 × 乗数 - 往復コスト）
@@ -147,30 +211,35 @@ def simulate_trades(
                 trades.append(
                     {
                         "entry_time": entry_time,
-                        "exit_time": timestamps[i],
+                        "exit_time": exit_time_rec,
                         "direction": "LONG" if position == 1 else "SHORT",
                         "entry_price": entry_price,
                         "exit_price": exit_price,
                         "pnl": trade_pnl,
                         "reason": reason,
                         "prob": entry_prob,
+                        "mfe_ticks": round(mfe / 5.0),
                         "direction_source": "momentum_10bars_sign",
                     }
                 )
                 logging.info(
-                    f"[TRADE] {entry_time} -> {timestamps[i]}"
+                    f"[TRADE] {entry_time} -> {exit_time_rec}"
                     f" | {'LONG ' if position == 1 else 'SHORT'}"
                     f" | entry={entry_price:,.0f}  exit={exit_price:,.0f}"
                     f" | {reason:<7}"
                     f" | {trade_pnl:+,.0f} JPY"
                     f" | prob={entry_prob:.3f}"
                     f" | bars={bars_held}"
+                    f" | mfe={round(mfe/5.0):.0f}tk"
+                    f" | be={'Y' if be_triggered else 'N'}"
                     f" | session={entry_session_key}"
                 )
 
                 position = 0
                 bars_held = 0
                 entry_session_key = None
+                be_triggered = False
+                mfe = 0.0
                 cooldown_bars = 60  # 決済後、30秒足60本(30分間)は再エントリーを禁止する
 
         # --- 2. エントリー判定 ---
@@ -246,6 +315,10 @@ def evaluate_window(
     max_momentum_abs: float,
     max_daily_trades: int = 0,
     max_prob: float = 1.0,
+    be_ticks: int = 0,
+    be_min_bars: int = 0,
+    weak_exit_bars: int = 0,
+    weak_exit_ticks: float = 0.0,
 ) -> List[dict]:
     """
     1つのWalk-Forwardウィンドウで必要なモデル群をロードし、テストデータでバックテストを行います。
@@ -395,6 +468,10 @@ def evaluate_window(
             max_momentum_abs=max_momentum_abs,
             max_daily_trades=max_daily_trades,
             max_prob=max_prob,
+            be_ticks=be_ticks,
+            be_min_bars=be_min_bars,
+            weak_exit_bars=weak_exit_bars,
+            weak_exit_ticks=weak_exit_ticks,
         )
         all_trades.extend(trades)
 
@@ -450,6 +527,37 @@ def main() -> None:
             "エントリーを許可するAIの確率上限（デフォルト 1.0 = 上限なし）。"
             "高確率ゾーンの過適合抑制に使用。例: 0.87 を指定すると prob>=0.87 はスキップ。"
         ),
+    )
+    parser.add_argument(
+        "--be-ticks",
+        type=int,
+        default=0,
+        help=(
+            "ブレークイーブンストップのトリガー幅（ティック数、0=無効）。"
+            "バー高値(LONG)/安値(SHORT)が entry ± be_ticks×5円 に達した翌バーから "
+            "SL をエントリー価格に引き上げる。"
+            "SL 幅と同じ値（例: sl-ticks=20 なら be-ticks=20）が推奨。"
+        ),
+    )
+    parser.add_argument(
+        "--be-min-bars",
+        type=int,
+        default=0,
+        help=(
+            "BE 発動を許可する最低保有本数（デフォルト 0 = 制限なし）。"
+            "エントリー直後の短期ノイズで BE が過剰発動するのを抑制する。"
+            "例: 20 を指定すると 10分間は BE 発動を抑止する。"
+        ),
+    )
+    parser.add_argument(
+        "--weak-exit-bars", type=int, default=0,
+        help="ウィーク決済の評価タイミング（本数、0=無効）。指定本数後もMFEが"
+             "--weak-exit-ticks未満なら現在のクローズ価格で即決済。例: 60 (30分後)。",
+    )
+    parser.add_argument(
+        "--weak-exit-ticks", type=float, default=0.0,
+        help="ウィーク決済をトリガーするMFE上限（ティック数）。"
+             "--weak-exit-barsと組み合わせて使用。例: 5 なら25円未満の含み益で撤退。",
     )
     args = parser.parse_args()
 
@@ -527,6 +635,10 @@ def main() -> None:
             args.max_momentum_abs,
             max_daily_trades=args.max_daily_trades,
             max_prob=args.max_prob,
+            be_ticks=args.be_ticks,
+            be_min_bars=args.be_min_bars,
+            weak_exit_bars=args.weak_exit_bars,
+            weak_exit_ticks=args.weak_exit_ticks,
         )
         all_trades.extend(trades)
 
@@ -562,6 +674,22 @@ def main() -> None:
     logging.info(f"Gross Loss   : -{gross_loss:,.0f} JPY")
     logging.info(f"Net Profit   : {net_profit:+,.0f} JPY")
     logging.info(f"Max Drawdown : {max_drawdown:,.0f} JPY")
+    logging.info("-" * 50)
+    for label, grp in [
+        ("TP",      [t for t in all_trades if t["reason"] == "TP"]),
+        ("SESSION", [t for t in all_trades if t["reason"] == "SESSION"]),
+        ("SL",      [t for t in all_trades if t["reason"] == "SL"]),
+        ("TIME",    [t for t in all_trades if t["reason"] == "TIME"]),
+        ("WEAK",    [t for t in all_trades if t["reason"] == "WEAK"]),
+    ]:
+        if not grp:
+            continue
+        w = sum(1 for t in grp if t["pnl"] > 0)
+        s = sum(t["pnl"] for t in grp)
+        logging.info(f"  {label:<7}: {len(grp):4d}  WR={w/len(grp)*100:.0f}%  {s:+,.0f} JPY")
+    avg_mfe = sum(t["mfe_ticks"] for t in all_trades) / total_trades
+    be_count = sum(1 for t in all_trades if t.get("mfe_ticks", 0) >= 1)
+    logging.info(f"  Avg MFE  : {avg_mfe:.1f} ticks  (MFE>0: {be_count}/{total_trades}件)")
     logging.info("=" * 50)
 
     # --- エクイティカーブ（資産曲線）の描画と保存 ---
